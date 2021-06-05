@@ -632,10 +632,7 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
                     self.agents.remove(&agent.peer);
 
                     if request_more_epochs {
-                        trace!("Requesting more epoch ids for peer: {:?}", agent.peer.id());
-                        let future =
-                            Self::request_epoch_ids(Arc::clone(&self.blockchain), agent).boxed();
-                        self.epoch_ids_stream.push(future);
+                        self.add_agent(agent);
                     } else {
                         // FIXME: Disconnect peer
                         // agent.peer.close()
@@ -660,7 +657,8 @@ impl<TNetwork: Network> Stream for HistorySync<TNetwork> {
                 }
                 Ok(NetworkEvent::PeerJoined(peer)) => {
                     // Create a ConsensusAgent for the peer that joined and request epoch_ids from it.
-                    self.add_peer(peer);
+                    let agent = Arc::new(ConsensusAgent::new(peer));
+                    self.add_agent(agent);
                 }
                 Err(_) => return Poll::Ready(None),
             }
@@ -821,8 +819,8 @@ impl<TNetwork: Network> Stream for HistorySync<TNetwork> {
 }
 
 impl<TNetwork: Network> HistorySyncStream<TNetwork::PeerType> for HistorySync<TNetwork> {
-    fn add_peer(&self, peer: Arc<TNetwork::PeerType>) {
-        let agent = Arc::new(ConsensusAgent::new(peer));
+    fn add_agent(&self, agent: Arc<ConsensusAgent<TNetwork::PeerType>>) {
+        trace!("Requesting more epoch ids for peer: {:?}", agent.peer.id());
         let future = Self::request_epoch_ids(Arc::clone(&self.blockchain), agent).boxed();
         self.epoch_ids_stream.push(future);
     }
