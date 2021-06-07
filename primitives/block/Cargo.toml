@@ -24,6 +24,7 @@ beserial = { path = "../../beserial" }
 beserial_derive = { path = "../../beserial/beserial_derive" }
 nimiq-bls = { path = "../../bls", features = ["beserial"]}
 nimiq-collections = { path = "../../collections", features = ["bitset"] }
+nimiq-database = { path = "../../database" }
 nimiq-handel = { path = "../../handel" }
 nimiq-hash = { path = "../../hash" }
 nimiq-hash_derive = { path = "../../hash/hash_derive" }
@@ -31,7 +32,7 @@ nimiq-keys = { path = "../../keys" }
 nimiq-macros = { path = "../../macros" }
 nimiq-nano-primitives = { path = "../../nano-primitives" }
 nimiq-network-interface = { path = "../../network-interface" }
-nimiq-primitives = { path = "..", features = ["policy", "networks", "coin"] }
+nimiq-primitives = { path = "..", features = ["policy", "networks", "coin", "validators"] }
 nimiq-transaction = { path = "../transaction" }
 nimiq-utils = { path = "../../utils", features = ["merkle"] }
 nimiq-vrf = { path = "../../vrf" }
