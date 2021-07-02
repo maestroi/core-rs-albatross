@@ -165,8 +165,25 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
     }
 
     fn init(&mut self) {
+        self.set_public_key();
         self.init_epoch();
         self.init_block_producer();
+    }
+
+    fn set_public_key(&mut self) {
+        let key = self.signing_key.clone();
+        let network = Arc::clone(&self.network);
+
+        // Set our own public key record on the DHT
+        tokio::spawn(async move {
+            // FIXME: Wait until !self.network.get_peers().is_empty()
+            if let Err(err) = network
+                .set_public_key(&key.public_key.compress(), &key.secret_key)
+                .await
+            {
+                error!("Could not set up DHT record: {:?}", err);
+            }
+        });
     }
 
     fn init_epoch(&mut self) {
@@ -191,19 +208,11 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
             .iter()
             .map(|validator| validator.public_key.compressed().clone())
             .collect();
-        let key = self.signing_key.clone();
         let network = Arc::clone(&self.network);
 
         // TODO might better be done without the task.
         // However we have an entire batch to execute the task so it should not be extremely bad.
-        // Also the setting up of our own public key record should probably not be done here but in `init` instead.
         tokio::spawn(async move {
-            if let Err(err) = network
-                .set_public_key(&key.public_key.compress(), &key.secret_key)
-                .await
-            {
-                error!("could not set up DHT record: {:?}", err);
-            }
             network.set_validators(validator_keys).await;
         });
     }
