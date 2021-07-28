@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use nimiq_block::Block;
 use nimiq_blockchain::{AbstractBlockchain, Blockchain};
-use nimiq_consensus::{Consensus as AbstractConsensus, ConsensusProxy as AbstractConsensusProxy};
+use nimiq_consensus::{
+    Consensus as AbstractConsensus, ConsensusEvent as AbstractConsensusEvent,
+    ConsensusProxy as AbstractConsensusProxy,
+};
 use nimiq_database::Environment;
 use nimiq_genesis::NetworkInfo;
 use nimiq_mempool::Mempool;
@@ -28,6 +31,7 @@ use nimiq_network_libp2p::Multiaddr;
 /// Alias for the Consensus and Validator specialized over libp2p network
 pub type Consensus = AbstractConsensus<Network>;
 pub type ConsensusProxy = AbstractConsensusProxy<Network>;
+pub type ConsensusEvent = AbstractConsensusEvent<Network>;
 pub type Validator = AbstractValidator<Network, ValidatorNetworkImpl<Network>>;
 
 /// Holds references to the relevant structs. This is then Arc'd in `Client` and a nice API is
