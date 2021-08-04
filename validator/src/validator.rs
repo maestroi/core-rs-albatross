@@ -23,6 +23,10 @@ use network_interface::{
 use nimiq_block_production::BlockProducer;
 use nimiq_tendermint::TendermintReturn;
 use nimiq_validator_network::ValidatorNetwork;
+use primitives::account::ValidatorId;
+use primitives::coin::Coin;
+use primitives::policy;
+use transaction_builder::{Recipient, TransactionBuilder};
 
 use crate::micro::{ProduceMicroBlock, ProduceMicroBlockEvent};
 use crate::r#macro::{PersistedMacroState, ProduceMacroBlock};
@@ -66,7 +70,8 @@ struct ProduceMicroBlockState {
 pub struct Validator<TNetwork: Network, TValidatorNetwork: ValidatorNetwork + 'static> {
     pub consensus: ConsensusProxy<TNetwork>,
     network: Arc<TValidatorNetwork>,
-    // TODO: Also have the validator ID here.
+
+    id: ValidatorId,
     signing_key: bls::KeyPair,
     wallet_key: Option<keys::KeyPair>,
     database: Database,
@@ -127,9 +132,13 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
         let network1 = Arc::clone(&network);
         let (proposal_sender, proposal_receiver) = ProposalBuffer::new();
 
+        // FIXME: Placeholder, update this line :point_down: as soon as the staking contract changes are merged
+        let id = ValidatorId::default(); 
+
         let mut this = Self {
             consensus: consensus.proxy(),
             network,
+            id,
             signing_key,
             wallet_key,
             database,
@@ -442,6 +451,54 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
         self.epoch_state.is_some()
     }
 
+    fn is_parked(&self) -> bool {
+        let staking_contract = self.consensus.blockchain.get_staking_contract();
+
+        staking_contract.current_epoch_parking.contains(&self.id)
+            || staking_contract.previous_epoch_parking.contains(&self.id)
+    }
+
+    fn unpark(&self, wallet_key: &keys::KeyPair) {
+        let network_id = self.consensus.blockchain.network_id;
+        let validator_registry = self
+            .consensus
+            .blockchain
+            .staking_contract_address()
+            .expect("NetworkInfo doesn't have a staking contract address set!");
+
+        let mut recipient = Recipient::new_staking_builder(Some(validator_registry.clone()));
+        recipient.unpark_validator(&self.id);
+
+        // Send the unpark transaction with a fixed height each epoch in case there's already a pushed unpark transaction.
+        // Note: If the validity window is ever less than an epoch's length, using the last macro block's height would require
+        // handling the case where the last macro block is more blocks away than the validity window inverval, since otherwise
+        // invalid transactions would be created.
+        let validity_start_height =
+            policy::macro_block_before(self.consensus.mempool.current_height());
+
+        let mut tx_builder = TransactionBuilder::new();
+        tx_builder
+            .with_sender(validator_registry.clone())
+            .with_value(Coin::ZERO)
+            .with_network_id(network_id)
+            .with_validity_start_height(validity_start_height)
+            .with_recipient(recipient.generate().unwrap());
+
+        let mut proof_builder = tx_builder.generate().unwrap().unwrap_signalling();
+        proof_builder.sign_with_validator_key_pair(&self.signing_key);
+        let mut proof_builder = proof_builder.generate().unwrap().unwrap_basic();
+        proof_builder.sign_with_key_pair(wallet_key);
+        let transaction = proof_builder.generate().unwrap();
+
+        let cn = self.consensus.clone();
+        tokio::spawn(async move {
+            trace!("Sending unpark transaction");
+            if let Err(_) = cn.send_transaction(transaction.clone()).await {
+                error!("Failed to send unpark transatction");
+            }
+        });
+    }
+
     pub fn validator_id(&self) -> u16 {
         self.epoch_state
             .as_ref()
@@ -490,6 +547,12 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork> Future
             }
             if self.micro_producer.is_some() {
                 self.poll_micro(cx);
+            }
+        }
+
+        if let Some(ref wallet_key) = self.wallet_key {
+            if self.is_parked() {
+                self.unpark(wallet_key);
             }
         }
 
