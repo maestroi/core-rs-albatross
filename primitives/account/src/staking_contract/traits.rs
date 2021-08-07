@@ -107,37 +107,53 @@ impl AccountTransactionInteraction for StakingContract {
                     .serialize_to_vec(),
                 )
             }
-            IncomingStakingTransactionData::RetireValidator { proof: signature } => {
-                let validator_address = signature.compute_signer();
+            IncomingStakingTransactionData::RetireValidator {
+                validator_address,
+                proof,
+            } => {
+                let warm_address = proof.compute_signer();
 
                 receipt = Some(
                     StakingContract::retire_validator(
                         accounts_tree,
                         db_txn,
                         &validator_address,
+                        warm_address,
                         block_height,
                     )?
                     .serialize_to_vec(),
                 );
             }
-            IncomingStakingTransactionData::ReactivateValidator { proof: signature } => {
-                let validator_address = signature.compute_signer();
+            IncomingStakingTransactionData::ReactivateValidator {
+                validator_address,
+                proof,
+            } => {
+                let warm_address = proof.compute_signer();
 
                 receipt = Some(
                     StakingContract::reactivate_validator(
                         accounts_tree,
                         db_txn,
                         &validator_address,
+                        warm_address,
                     )?
                     .serialize_to_vec(),
                 );
             }
-            IncomingStakingTransactionData::UnparkValidator { proof: signature } => {
-                let validator_address = signature.compute_signer();
+            IncomingStakingTransactionData::UnparkValidator {
+                validator_address,
+                proof,
+            } => {
+                let warm_address = proof.compute_signer();
 
                 receipt = Some(
-                    StakingContract::unpark_validator(accounts_tree, db_txn, &validator_address)?
-                        .serialize_to_vec(),
+                    StakingContract::unpark_validator(
+                        accounts_tree,
+                        db_txn,
+                        &validator_address,
+                        warm_address,
+                    )?
+                    .serialize_to_vec(),
                 );
             }
             IncomingStakingTransactionData::CreateStaker {
@@ -580,9 +596,6 @@ impl AccountInherentInteraction for StakingContract {
                         .insert(slot.slot);
                 }
 
-                // All checks passed, not allowed to fail from here on!
-                trace!("Trying to put staking contract in the accounts tree.");
-
                 receipt = Some(
                     SlashReceipt {
                         newly_parked,
@@ -605,6 +618,7 @@ impl AccountInherentInteraction for StakingContract {
                 // Parking sets and disabled slots are only cleared on epoch changes.
                 if inherent.ty == InherentType::FinalizeEpoch {
                     // But first, retire all validators that have been parked for more than one epoch.
+                    // TODO: Don't call retire, do the actual operations here.
                     for validator_address in staking_contract.previous_epoch_parking {
                         StakingContract::retire_validator(
                             accounts_tree,
@@ -634,6 +648,7 @@ impl AccountInherentInteraction for StakingContract {
             }
         }
 
+        trace!("Trying to put staking contract in the accounts tree.");
         accounts_tree.put(
             db_txn,
             &StakingContract::get_key_staking_contract(),

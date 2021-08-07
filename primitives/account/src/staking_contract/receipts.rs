@@ -5,9 +5,9 @@ use nimiq_bls::CompressedPublicKey as BlsPublicKey;
 use nimiq_hash::Blake2bHash;
 use nimiq_keys::Address;
 
-/// A receipt for slash inherents. It shows whether a given slot or validator was newly disabled,
-/// lost rewards or parked by a specific slash inherent. This is necessary to be able to revert
-/// slash inherents.
+/// A collection of receipts for inherents/transactions. This is necessary to be able to revert
+/// those inherents/transactions.
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SlashReceipt {
     pub newly_parked: bool,

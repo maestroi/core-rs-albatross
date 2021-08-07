@@ -285,8 +285,29 @@ impl StakingContract {
         accounts_tree: &AccountsTree,
         db_txn: &mut WriteTransaction,
         validator_address: &Address,
+        warm_address: Address,
         block_height: u32,
     ) -> Result<RetireValidatorReceipt, AccountError> {
+        // Get the validator and update it.
+        let mut validator =
+            match StakingContract::get_validator(accounts_tree, db_txn, validator_address) {
+                Some(v) => v,
+                None => {
+                    return Err(AccountError::NonExistentAddress {
+                        address: validator_address.clone(),
+                    });
+                }
+            };
+
+        if warm_address != validator.warm_key {
+            error!(
+                "The warm address that signed the transaction matches the warm address of the validator."
+            );
+            return Err(AccountError::InvalidSignature);
+        }
+
+        validator.inactivity_flag = Some(block_height);
+
         // Get the staking contract main and update it.
         let mut staking_contract = StakingContract::get_staking_contract(accounts_tree, db_txn);
 
@@ -308,19 +329,6 @@ impl StakingContract {
         let previous_parking = staking_contract
             .previous_epoch_parking
             .remove(validator_address);
-
-        // Get the validator and update it.
-        let mut validator =
-            match StakingContract::get_validator(accounts_tree, db_txn, validator_address) {
-                Some(v) => v,
-                None => {
-                    return Err(AccountError::NonExistentAddress {
-                        address: validator_address.clone(),
-                    });
-                }
-            };
-
-        validator.inactivity_flag = Some(block_height);
 
         // All checks passed, not allowed to fail from here on!
         trace!("Trying to put staking contract in the accounts tree.");
@@ -411,8 +419,9 @@ impl StakingContract {
         accounts_tree: &AccountsTree,
         db_txn: &mut WriteTransaction,
         validator_address: &Address,
+        warm_address: Address,
     ) -> Result<ReactivateValidatorReceipt, AccountError> {
-        // Get the validator.
+        // Get the validator and check that the signature is valid.
         let mut validator =
             match StakingContract::get_validator(accounts_tree, db_txn, validator_address) {
                 Some(v) => v,
@@ -422,6 +431,13 @@ impl StakingContract {
                     });
                 }
             };
+
+        if warm_address != validator.warm_key {
+            error!(
+                "The warm address that signed the transaction matches the warm address of the validator."
+            );
+            return Err(AccountError::InvalidSignature);
+        }
 
         // Create receipt now.
         let receipt = match validator.inactivity_flag {
@@ -523,7 +539,26 @@ impl StakingContract {
         accounts_tree: &AccountsTree,
         db_txn: &mut WriteTransaction,
         validator_address: &Address,
+        warm_address: Address,
     ) -> Result<UnparkValidatorReceipt, AccountError> {
+        // Get the validator and check that the signature is valid.
+        let mut validator =
+            match StakingContract::get_validator(accounts_tree, db_txn, validator_address) {
+                Some(v) => v,
+                None => {
+                    return Err(AccountError::NonExistentAddress {
+                        address: validator_address.clone(),
+                    });
+                }
+            };
+
+        if warm_address != validator.warm_key {
+            error!(
+                "The warm address that signed the transaction matches the warm address of the validator."
+            );
+            return Err(AccountError::InvalidSignature);
+        }
+
         // Get the staking contract main and update it.
         let mut staking_contract = StakingContract::get_staking_contract(accounts_tree, db_txn);
 
