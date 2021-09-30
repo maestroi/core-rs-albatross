@@ -9,7 +9,9 @@ use beserial::ReadBytesExt;
 use beserial::SerializingError;
 use beserial::WriteBytesExt;
 use beserial::{Deserialize, DeserializeWithLength, Serialize, SerializeWithLength};
+use nimiq_database::{FromDatabaseValue, IntoDatabaseValue};
 use nimiq_hash::argon2kdf::{compute_argon2_kdf, Argon2Error};
+use std::io;
 
 pub trait Verify {
     fn verify(&self) -> bool;
@@ -239,7 +241,7 @@ impl<T: Clear + Deserialize + Serialize> Locked<T> {
     ) -> Result<Self, Argon2Error> {
         let mut salt = vec![0; salt_length];
         OsRng.fill_bytes(salt.as_mut_slice());
-        Self::lock(&secret, password, iterations, salt)
+        Self::lock(secret, password, iterations, salt)
     }
 
     pub fn into_otp_lock(self) -> OtpLock<T> {
@@ -294,6 +296,26 @@ impl<T: Clear + Deserialize + Serialize> Deserialize for Locked<T> {
             iterations,
             phantom: PhantomData,
         })
+    }
+}
+
+impl<T: Default + Deserialize + Serialize> IntoDatabaseValue for Locked<T> {
+    fn database_byte_size(&self) -> usize {
+        self.serialized_size()
+    }
+
+    fn copy_into_database(&self, mut bytes: &mut [u8]) {
+        Serialize::serialize(&self, &mut bytes).unwrap();
+    }
+}
+
+impl<T: Default + Deserialize + Serialize> FromDatabaseValue for Locked<T> {
+    fn copy_from_database(bytes: &[u8]) -> io::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut cursor = io::Cursor::new(bytes);
+        Ok(Deserialize::deserialize(&mut cursor)?)
     }
 }
 
@@ -396,7 +418,7 @@ impl<T: Clear + Deserialize + Serialize> OtpLock<T> {
     #[inline]
     pub fn unlocked_ref(&self) -> Option<&Unlocked<T>> {
         match self {
-            OtpLock::Unlocked(unlocked) => Some(&unlocked),
+            OtpLock::Unlocked(unlocked) => Some(unlocked),
             _ => None,
         }
     }

@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::task::{Context, Poll};
 use futures::{FutureExt, Stream, StreamExt};
+use parking_lot::RwLock;
 use tokio_stream::wrappers::BroadcastStream;
 
 use block::{Block, MacroBlock};
@@ -51,7 +52,7 @@ struct SyncCluster<TPeer: Peer> {
     pending_batch_sets: VecDeque<PendingBatchSet>,
 
     adopted_batch_set: bool,
-    blockchain: Arc<Blockchain>,
+    blockchain: Arc<RwLock<Blockchain>>,
 }
 
 impl<TPeer: Peer + 'static> SyncCluster<TPeer> {
@@ -62,13 +63,23 @@ impl<TPeer: Peer + 'static> SyncCluster<TPeer> {
         ids: Vec<Blake2bHash>,
         first_epoch_number: usize,
         peers: Vec<Weak<ConsensusAgent<TPeer>>>,
-        blockchain: Arc<Blockchain>,
+        blockchain: Arc<RwLock<Blockchain>>,
     ) -> Self {
         let batch_set_queue = SyncQueue::new(
             ids.clone(),
             peers.clone(),
             Self::NUM_PENDING_BATCH_SETS,
-            |id, peer| async move { peer.request_epoch(id).await.ok() }.boxed(),
+            |id, peer| {
+                async move {
+                    if let Ok(batch) = peer.request_epoch(id).await {
+                        if batch.block.is_some() {
+                            return Some(batch);
+                        }
+                    }
+                    None
+                }
+                .boxed()
+            },
         );
         let history_queue = SyncQueue::new(
             Vec::<(u32, u32, usize)>::new(),
@@ -96,18 +107,23 @@ impl<TPeer: Peer + 'static> SyncCluster<TPeer> {
     }
 
     fn on_epoch_received(&mut self, epoch: BatchSetInfo) -> Result<(), SyncClusterResult> {
+        // `epoch.block` is Some, since we filtered it accordingly in the `request_fn`
+        let block = epoch.block.expect("epoch.block should exist");
+
+        let blockchain = self.blockchain.read();
+
         // this might be a checkpoint
         // TODO Verify macro blocks and their ordering
         // Currently we only do a very basic check here
-        let current_block_number = self.blockchain.block_number();
-        if epoch.block.header.block_number <= current_block_number {
+        let current_block_number = blockchain.block_number();
+        if block.header.block_number <= current_block_number {
             debug!("Received outdated epoch at block {}", current_block_number);
             return Err(SyncClusterResult::Outdated);
         }
 
         // Prepare pending info.
         let mut pending_batch_set = PendingBatchSet {
-            block: epoch.block,
+            block,
             history_len: epoch.history_len as usize,
             history: Vec::new(),
         };
@@ -117,8 +133,7 @@ impl<TPeer: Peer + 'static> SyncCluster<TPeer> {
 
         let mut start_index = 0;
         if policy::epoch_at(current_block_number) == epoch_number {
-            let num_known = self
-                .blockchain
+            let num_known = blockchain
                 .history_store
                 .get_num_extended_transactions(epoch_number, None);
 
@@ -128,8 +143,7 @@ impl<TPeer: Peer + 'static> SyncCluster<TPeer> {
             // Only if there are full chunks they need to be proven.
             if num_full_chunks > 0 {
                 // TODO: Can probably be done more efficiently.
-                let known_chunk = self
-                    .blockchain
+                let known_chunk = blockchain
                     .history_store
                     .prove_chunk(
                         epoch_number,
@@ -331,6 +345,7 @@ impl<TPeer: Peer + 'static> Stream for SyncCluster<TPeer> {
 }
 
 struct EpochIds<TPeer: Peer> {
+    on_same_chain: bool,
     ids: Vec<Blake2bHash>,
     checkpoint_id: Option<Blake2bHash>, // The most recent checkpoint block in the latest epoch.
     first_epoch_number: usize,
@@ -340,6 +355,7 @@ struct EpochIds<TPeer: Peer> {
 impl<TPeer: Peer> Clone for EpochIds<TPeer> {
     fn clone(&self) -> Self {
         EpochIds {
+            on_same_chain: self.on_same_chain,
             ids: self.ids.clone(),
             checkpoint_id: self.checkpoint_id.clone(),
             first_epoch_number: self.first_epoch_number,
@@ -378,7 +394,7 @@ impl<T, E: std::fmt::Debug> From<Result<T, E>> for SyncClusterResult {
 }
 
 pub struct HistorySync<TNetwork: Network> {
-    blockchain: Arc<Blockchain>,
+    blockchain: Arc<RwLock<Blockchain>>,
     network_event_rx: BroadcastStream<NetworkEvent<TNetwork::PeerType>>,
     epoch_ids_stream: FuturesUnordered<BoxFuture<'static, Option<EpochIds<TNetwork::PeerType>>>>,
     epoch_clusters: VecDeque<SyncCluster<TNetwork::PeerType>>,
@@ -392,7 +408,7 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
     const MAX_CLUSTERS: usize = 100;
 
     pub fn new(
-        blockchain: Arc<Blockchain>,
+        blockchain: Arc<RwLock<Blockchain>>,
         network_event_rx: BroadcastStream<NetworkEvent<TNetwork::PeerType>>,
     ) -> Self {
         Self {
@@ -412,13 +428,14 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
     }
 
     async fn request_epoch_ids(
-        blockchain: Arc<Blockchain>,
+        blockchain: Arc<RwLock<Blockchain>>,
         agent: Arc<ConsensusAgent<TNetwork::PeerType>>,
     ) -> Option<EpochIds<TNetwork::PeerType>> {
         trace!("requesting epoch ids");
         let (locators, epoch_number) = {
             // Order matters here. The first hash found by the recipient of the request  will be used, so they need to be
             // in backwards block height order.
+            let blockchain = blockchain.read();
             let election_head = blockchain.election_head();
             let macro_head = blockchain.macro_head();
 
@@ -446,8 +463,20 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
 
         match result {
             Ok(block_hashes) => {
+                if block_hashes.hashes.is_none() {
+                    return Some(EpochIds {
+                        on_same_chain: false,
+                        ids: Vec::new(),
+                        checkpoint_id: None,
+                        first_epoch_number: 0,
+                        sender: agent,
+                    });
+                }
+
+                let hashes = block_hashes.hashes.unwrap();
+
                 // Get checkpoint id if exists.
-                let checkpoint_id = block_hashes.hashes.last().and_then(|(ty, id)| {
+                let checkpoint_id = hashes.last().and_then(|(ty, id)| {
                     if *ty == BlockHashType::Checkpoint {
                         Some(id.clone())
                     } else {
@@ -455,8 +484,7 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
                     }
                 });
                 // Filter checkpoint from block hashes and map to hash.
-                let epoch_ids = block_hashes
-                    .hashes
+                let epoch_ids = hashes
                     .into_iter()
                     .filter_map(|(ty, id)| {
                         if ty == BlockHashType::Election {
@@ -467,6 +495,7 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
                     })
                     .collect();
                 Some(EpochIds {
+                    on_same_chain: true,
                     ids: epoch_ids,
                     checkpoint_id,
                     first_epoch_number: epoch_number as usize + 1,
@@ -482,15 +511,20 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
     }
 
     fn cluster_epoch_ids(&mut self, mut epoch_ids: EpochIds<TNetwork::PeerType>) {
+        if !epoch_ids.on_same_chain {
+            return;
+        }
+
         let checkpoint_epoch = epoch_ids.get_checkpoint_epoch();
         let agent = epoch_ids.sender;
 
-        // Truncate beginning of cluster to our current blockchain state.
-        let current_id = self.blockchain.election_head_hash();
+        let (current_id, election_head) = {
+            let blockchain = self.blockchain.read();
+            (blockchain.election_head_hash(), blockchain.election_head())
+        };
 
         // If `epoch_ids` includes known blocks, truncate (or discard on fork prior to our accepted state).
-        let current_epoch =
-            policy::epoch_at(self.blockchain.election_head().header.block_number) as usize;
+        let current_epoch = policy::epoch_at(election_head.header.block_number) as usize;
         if !epoch_ids.ids.is_empty() && epoch_ids.first_epoch_number <= current_epoch {
             // Check most recent id against our state.
             if current_id == epoch_ids.ids[current_epoch - epoch_ids.first_epoch_number] {
@@ -668,14 +702,14 @@ impl<TNetwork: Network> HistorySync<TNetwork> {
 
     fn find_best_cluster(
         clusters: &mut VecDeque<SyncCluster<TNetwork::PeerType>>,
-        blockchain: &Blockchain,
+        blockchain: &Arc<RwLock<Blockchain>>,
     ) -> Option<SyncCluster<TNetwork::PeerType>> {
         if clusters.is_empty() {
             return None;
         }
 
         let current_epoch =
-            policy::epoch_at(blockchain.election_head().header.block_number) as usize;
+            policy::epoch_at(blockchain.read().election_head().header.block_number) as usize;
 
         let (best_idx, _) = clusters
             .iter()
@@ -785,10 +819,13 @@ impl<TNetwork: Network> Stream for HistorySync<TNetwork> {
                     // The peer might have disconnected during the request.
                     // FIXME Check if the peer is still connected
 
-                    // FIXME We want to distinguish between "locator hash not found" (i.e. peer is
-                    //  on a different chain) and "no more hashes past locator" (we are in sync with
-                    //  the peer).
-                    if epoch_ids.ids.is_empty() && epoch_ids.checkpoint_id.is_none() {
+                    if !epoch_ids.on_same_chain {
+                        debug!(
+                            "Peer is on different chain: {:?}",
+                            epoch_ids.sender.peer.id()
+                        );
+                        // TODO: Send further locators. Possibly find branching point of fork.
+                    } else if epoch_ids.ids.is_empty() && epoch_ids.checkpoint_id.is_none() {
                         // We are synced with this peer.
                         debug!(
                             "Peer has finished syncing: {:?}",
@@ -821,10 +858,11 @@ impl<TNetwork: Network> Stream for HistorySync<TNetwork> {
                 .expect("active_epoch_cluster should be set");
 
             let result = match ready!(best_cluster.poll_next_unpin(cx)) {
-                Some(Ok(epoch)) => SyncClusterResult::from(
-                    self.blockchain
-                        .push_history_sync(Block::Macro(epoch.block), &epoch.history),
-                ),
+                Some(Ok(epoch)) => SyncClusterResult::from(Blockchain::push_history_sync(
+                    self.blockchain.upgradable_read(),
+                    Block::Macro(epoch.block),
+                    &epoch.history,
+                )),
                 Some(Err(e)) => {
                     log::debug!("Polling the best SyncCluster returned an error: {:?}", e);
                     SyncClusterResult::Error
@@ -869,7 +907,7 @@ impl<TNetwork: Network> Stream for HistorySync<TNetwork> {
         // When no more epochs are to be processed, we continue with checkpoint blocks.
         // Poll the best checkpoint cluster.
         let current_epoch =
-            policy::epoch_at(self.blockchain.election_head().header.block_number) as usize;
+            policy::epoch_at(self.blockchain.read().election_head().header.block_number) as usize;
 
         // Initialize active_checkpoint_cluster if there is none.
         if self.active_checkpoint_cluster.is_none() {
@@ -887,10 +925,11 @@ impl<TNetwork: Network> Stream for HistorySync<TNetwork> {
                 result = SyncClusterResult::NoMoreEpochs;
             } else {
                 result = match ready!(best_cluster.poll_next_unpin(cx)) {
-                    Some(Ok(batch)) => SyncClusterResult::from(
-                        self.blockchain
-                            .push_history_sync(Block::Macro(batch.block), &batch.history),
-                    ),
+                    Some(Ok(batch)) => SyncClusterResult::from(Blockchain::push_history_sync(
+                        self.blockchain.upgradable_read(),
+                        Block::Macro(batch.block),
+                        &batch.history,
+                    )),
                     Some(Err(e)) => e,
                     None => SyncClusterResult::NoMoreEpochs,
                 };
@@ -928,6 +967,7 @@ mod tests {
     use nimiq_database::volatile::VolatileEnvironment;
     use nimiq_genesis::NetworkId;
     use nimiq_network_mock::{MockHub, MockNetwork, MockPeer};
+    use nimiq_utils::time::OffsetTime;
 
     use super::*;
 
@@ -955,15 +995,19 @@ mod tests {
             }
 
             EpochIds {
+                on_same_chain: true,
                 ids,
                 checkpoint_id: None,
                 first_epoch_number,
-                sender: Arc::clone(&agent),
+                sender: Arc::clone(agent),
             }
         }
 
+        let time = Arc::new(OffsetTime::new());
         let env1 = VolatileEnvironment::new(10).unwrap();
-        let blockchain = Arc::new(Blockchain::new(env1, NetworkId::UnitAlbatross).unwrap());
+        let blockchain = Arc::new(RwLock::new(
+            Blockchain::new(env1, NetworkId::UnitAlbatross, time).unwrap(),
+        ));
 
         let mut hub = MockHub::default();
 
@@ -980,7 +1024,7 @@ mod tests {
             .collect();
 
         fn run_test<F>(
-            blockchain: &Arc<Blockchain>,
+            blockchain: &Arc<RwLock<Blockchain>>,
             net: &Arc<MockNetwork>,
             epoch_ids1: EpochIds<MockPeer>,
             epoch_ids2: EpochIds<MockPeer>,
@@ -990,17 +1034,15 @@ mod tests {
             F: Fn(HistorySync<MockNetwork>),
         {
             let mut sync =
-                HistorySync::<MockNetwork>::new(Arc::clone(&blockchain), net.subscribe_events());
+                HistorySync::<MockNetwork>::new(Arc::clone(blockchain), net.subscribe_events());
             sync.cluster_epoch_ids(epoch_ids1.clone());
             sync.cluster_epoch_ids(epoch_ids2.clone());
             test(sync);
 
             // Symmetric check
             if symmetric {
-                let mut sync = HistorySync::<MockNetwork>::new(
-                    Arc::clone(&blockchain),
-                    net.subscribe_events(),
-                );
+                let mut sync =
+                    HistorySync::<MockNetwork>::new(Arc::clone(blockchain), net.subscribe_events());
                 sync.cluster_epoch_ids(epoch_ids2);
                 sync.cluster_epoch_ids(epoch_ids1);
                 test(sync);

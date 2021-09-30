@@ -1,14 +1,12 @@
 use std::fmt::{self, Debug, Formatter};
 
-use nimiq_mmr::mmr::proof::{Proof, RangeProof};
-
 use beserial::{
     Deserialize, DeserializeWithLength, ReadBytesExt, Serialize, SerializeWithLength,
     SerializingError, WriteBytesExt,
 };
 use nimiq_hash::Blake2bHash;
+use nimiq_mmr::mmr::proof::{Proof, RangeProof};
 
-use crate::history_store::history_tree_hash::HistoryTreeHash;
 use crate::history_store::ExtendedTransaction;
 
 /// The chunk size used in our protocol.
@@ -16,7 +14,7 @@ use crate::history_store::ExtendedTransaction;
 pub const CHUNK_SIZE: usize = 1000;
 
 pub struct HistoryTreeChunk {
-    pub(crate) proof: RangeProof<HistoryTreeHash>,
+    pub(crate) proof: RangeProof<Blake2bHash>,
     pub history: Vec<ExtendedTransaction>,
 }
 
@@ -31,6 +29,7 @@ impl Debug for HistoryTreeChunk {
             dbg.field("first_block", &first.block_number);
             dbg.field("last_block", &last.block_number);
         }
+        dbg.field("history", &self.history);
         dbg.finish()
     }
 }
@@ -38,8 +37,6 @@ impl Debug for HistoryTreeChunk {
 impl HistoryTreeChunk {
     /// Tries to verify
     pub fn verify(&self, expected_root: Blake2bHash, leaf_index: usize) -> Option<bool> {
-        let expected_root = HistoryTreeHash(expected_root);
-
         // TODO: Modify MMR library so that we do not need to clone here.
         self.proof
             .verify_with_start(&expected_root, leaf_index, self.history.clone())

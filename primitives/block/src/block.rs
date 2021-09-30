@@ -1,12 +1,14 @@
 use std::convert::TryFrom;
-use std::fmt;
+use std::{fmt, io};
 
 use bitflags::bitflags;
 
 use beserial::{Deserialize, ReadBytesExt, Serialize, SerializingError, WriteBytesExt};
+use nimiq_database::{FromDatabaseValue, IntoDatabaseValue};
 use nimiq_hash::{Blake2bHash, Blake2sHash, Hash, SerializeContent};
 use nimiq_hash_derive::SerializeContent;
 use nimiq_primitives::coin::Coin;
+use nimiq_primitives::policy;
 use nimiq_primitives::slots::Validators;
 use nimiq_transaction::Transaction;
 use nimiq_vrf::VrfSeed;
@@ -14,7 +16,6 @@ use nimiq_vrf::VrfSeed;
 use crate::macro_block::{MacroBlock, MacroHeader};
 use crate::micro_block::{MicroBlock, MicroHeader};
 use crate::{MacroBody, MicroBody, MicroJustification, TendermintProof};
-use nimiq_primitives::policy;
 
 /// Defines the type of the block, either Micro or Macro (which includes both checkpoint and
 /// election blocks).
@@ -334,6 +335,26 @@ impl fmt::Display for Block {
     }
 }
 
+impl IntoDatabaseValue for Block {
+    fn database_byte_size(&self) -> usize {
+        self.serialized_size()
+    }
+
+    fn copy_into_database(&self, mut bytes: &mut [u8]) {
+        Serialize::serialize(&self, &mut bytes).unwrap();
+    }
+}
+
+impl FromDatabaseValue for Block {
+    fn copy_from_database(bytes: &[u8]) -> io::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut cursor = io::Cursor::new(bytes);
+        Ok(Deserialize::deserialize(&mut cursor)?)
+    }
+}
+
 /// The enum representing a block header. Blocks can either be Micro blocks or Macro blocks (which
 /// includes both checkpoint and election blocks).
 #[derive(Clone, Debug, Eq, PartialEq, SerializeContent)]
@@ -463,7 +484,6 @@ impl BlockHeader {
     }
 }
 
-#[allow(clippy::derive_hash_xor_eq)] // TODO: Shouldn't be necessary
 impl Hash for BlockHeader {}
 
 impl Serialize for BlockHeader {

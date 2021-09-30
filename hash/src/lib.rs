@@ -12,6 +12,9 @@ use beserial::{Deserialize, Serialize};
 use nimiq_macros::{add_hex_io_fns_typed_arr, create_typed_array};
 
 pub use self::sha512::*;
+use nimiq_database::{AsDatabaseBytes, FromDatabaseValue};
+use nimiq_mmr::hash::Merge;
+use std::borrow::Cow;
 
 pub mod argon2kdf;
 pub mod hmac;
@@ -154,6 +157,37 @@ impl Hasher for Blake2bHasher {
     fn finish(self) -> Blake2bHash {
         let result = self.0.finalize();
         Blake2bHash::from(result.as_bytes())
+    }
+}
+
+impl AsDatabaseBytes for Blake2bHash {
+    fn as_database_bytes(&self) -> Cow<[u8]> {
+        Cow::Borrowed(self.as_bytes())
+    }
+}
+
+impl FromDatabaseValue for Blake2bHash {
+    fn copy_from_database(bytes: &[u8]) -> io::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(bytes.into())
+    }
+}
+
+impl Merge for Blake2bHash {
+    /// Hashes just a prefix.
+    fn empty(prefix: u64) -> Self {
+        let message = prefix.to_be_bytes().to_vec();
+        message.hash()
+    }
+
+    /// Hashes a prefix and two Blake2b hashes together.
+    fn merge(&self, other: &Self, prefix: u64) -> Self {
+        let mut message = prefix.to_be_bytes().to_vec();
+        message.append(&mut self.serialize_to_vec());
+        message.append(&mut other.serialize_to_vec());
+        message.hash()
     }
 }
 

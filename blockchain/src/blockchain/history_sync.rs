@@ -1,4 +1,4 @@
-use parking_lot::MutexGuard;
+use parking_lot::{RwLockUpgradableReadGuard, RwLockWriteGuard};
 
 use nimiq_block::{Block, BlockError};
 use nimiq_database::{ReadTransaction, WriteTransaction};
@@ -10,7 +10,6 @@ use crate::chain_info::ChainInfo;
 use crate::history_store::{ExtTxData, ExtendedTransaction, HistoryStore};
 use crate::{AbstractBlockchain, Blockchain, BlockchainEvent, PushError, PushResult};
 use nimiq_account::{Inherent, InherentType};
-use nimiq_primitives::account::AccountType;
 
 /// Implements methods to push macro blocks into the chain when an history node is syncing. This
 /// type of syncing is called history syncing. It works by having the node get all the election
@@ -29,7 +28,7 @@ impl Blockchain {
     /// blocks even after you pushed micro blocks.
     /// You just cannot push micro blocks with this method.
     pub fn push_history_sync(
-        &self,
+        this: RwLockUpgradableReadGuard<Self>,
         block: Block,
         ext_txs: &[ExtendedTransaction],
     ) -> Result<PushResult, PushError> {
@@ -39,11 +38,8 @@ impl Blockchain {
             "You can't push micro blocks with history sync!"
         );
 
-        // Only one push operation at a time.
-        let push_lock = self.push_lock.lock();
-
         // Create a new database read transaction.
-        let read_txn = ReadTransaction::new(&self.env);
+        let read_txn = ReadTransaction::new(&this.env);
 
         // Unwrap the block.
         let macro_block = block.unwrap_macro_ref();
@@ -55,7 +51,7 @@ impl Blockchain {
         }
 
         // Check if we already know this block.
-        if self
+        if this
             .chain_store
             .get_chain_info(&macro_block.hash(), false, Some(&read_txn))
             .is_some()
@@ -65,9 +61,9 @@ impl Blockchain {
         }
 
         // Get the chain info of the current macro head.
-        let prev_macro_hash = self.macro_head_hash();
+        let prev_macro_hash = this.macro_head_hash();
 
-        let prev_macro_info = self
+        let prev_macro_info = this
             .get_chain_info(&prev_macro_hash, false, Some(&read_txn))
             .expect("Couldn't fetch chain info for the macro head of the chain!");
 
@@ -123,7 +119,7 @@ impl Blockchain {
         if !justification.verify(
             macro_block.hash(),
             macro_block.header.block_number,
-            &self.current_validators().unwrap(),
+            &this.current_validators().unwrap(),
         ) {
             warn!("Rejecting block - macro block with bad justification");
             return Err(PushError::InvalidBlock(BlockError::InvalidJustification));
@@ -131,29 +127,31 @@ impl Blockchain {
 
         info!("Syncing at macro block #{}", block.block_number());
 
+        drop(read_txn);
+
         // Extend the chain with this block.
-        self.extend_history_sync(block, ext_txs, prev_macro_info, push_lock)
+        Blockchain::extend_history_sync(this, block, ext_txs, prev_macro_info)
     }
 
     /// Extends the current chain with a macro block (election or checkpoint) during history sync.
     fn extend_history_sync(
-        &self,
+        this: RwLockUpgradableReadGuard<Blockchain>,
         block: Block,
         ext_txs: &[ExtendedTransaction],
         mut prev_macro_info: ChainInfo,
-        push_lock: MutexGuard<()>,
     ) -> Result<PushResult, PushError> {
+        let env = this.env.clone();
         // Create a new database write transaction.
-        let mut txn = WriteTransaction::new(&self.env);
+        let mut txn = WriteTransaction::new(&env);
 
         // If there are micro blocks already in the blockchain, then we need to revert the
         // blockchain to the last macro block.
-        let num_blocks = self
+        let num_blocks = this
             .block_number()
             .checked_sub(prev_macro_info.head.block_number())
             .expect("Head of the chain can't be before the macro head!");
 
-        self.revert_blocks(num_blocks, &mut txn)?;
+        this.revert_blocks(num_blocks, &mut txn)?;
 
         // Get the block hash.
         let block_hash = block.hash();
@@ -182,13 +180,13 @@ impl Blockchain {
             cum_tx_fees,
         };
 
-        self.chain_store
+        this.chain_store
             .put_chain_info(&mut txn, &block_hash, &chain_info, true);
 
         // Update the chain info for the previous macro block and store it.
         prev_macro_info.main_chain_successor = Some(chain_info.head.hash());
 
-        self.chain_store.put_chain_info(
+        this.chain_store.put_chain_info(
             &mut txn,
             &prev_macro_info.head.hash(),
             &prev_macro_info,
@@ -196,10 +194,7 @@ impl Blockchain {
         );
 
         // Set the head of the chain store to the current block.
-        self.chain_store.set_head(&mut txn, &block_hash);
-
-        // Get a read transaction to the current state.
-        let state = self.state.read();
+        this.chain_store.set_head(&mut txn, &block_hash);
 
         // Get the index for the first extended transaction that was not already added in past macro
         // blocks.
@@ -233,23 +228,7 @@ impl Blockchain {
             }
 
             match &ext_tx.data {
-                ExtTxData::Basic(tx) => {
-                    // If the transaction is a reward transaction, then we convert it to an inherent.
-                    // This is because we ignore reward transactions when syncing, we prefer to update
-                    // the state using the inherents.
-                    if tx.sender_type == AccountType::Reward {
-                        let reward = Inherent {
-                            ty: InherentType::Reward,
-                            target: tx.recipient.clone(),
-                            value: tx.value,
-                            data: vec![],
-                        };
-
-                        block_inherents.last_mut().unwrap().push(reward.clone())
-                    } else {
-                        block_transactions.last_mut().unwrap().push(tx.clone())
-                    };
-                }
+                ExtTxData::Basic(tx) => block_transactions.last_mut().unwrap().push(tx.clone()),
                 ExtTxData::Inherent(tx) => block_inherents.last_mut().unwrap().push(tx.clone()),
             }
         }
@@ -259,13 +238,9 @@ impl Blockchain {
         // so we need to add them again in order to correctly sync.
         for (i, block_number) in block_numbers.iter().enumerate() {
             if policy::is_macro_block_at(*block_number) {
-                let staking_contract_address = self
-                    .staking_contract_address()
-                    .expect("NetworkInfo doesn't have a staking contract address set!");
-
                 let finalize_batch = Inherent {
                     ty: InherentType::FinalizeBatch,
-                    target: staking_contract_address.clone(),
+                    target: this.staking_contract_address(),
                     value: Coin::ZERO,
                     data: vec![],
                 };
@@ -275,7 +250,7 @@ impl Blockchain {
                 if policy::is_election_block_at(*block_number) {
                     let finalize_epoch = Inherent {
                         ty: InherentType::FinalizeEpoch,
-                        target: staking_contract_address.clone(),
+                        target: this.staking_contract_address(),
                         value: Coin::ZERO,
                         data: vec![],
                     };
@@ -288,7 +263,7 @@ impl Blockchain {
         // Update the accounts tree, one block at a time.
         for i in 0..block_numbers.len() {
             // Commit block to AccountsTree and create the receipts.
-            let receipts = state.accounts.commit(
+            let receipts = this.state.accounts.commit(
                 &mut txn,
                 &block_transactions[i],
                 &block_inherents[i],
@@ -301,17 +276,17 @@ impl Blockchain {
                 warn!("Rejecting block - commit failed: {:?}", e);
                 txn.abort();
                 #[cfg(feature = "metrics")]
-                self.metrics.note_invalid_block();
+                this.metrics.note_invalid_block();
                 return Err(PushError::AccountsError(e));
             }
         }
 
         // Macro blocks are final and receipts for the previous batch are no longer necessary
         // as rebranching across this block is not possible.
-        self.chain_store.clear_receipts(&mut txn);
+        this.chain_store.clear_receipts(&mut txn);
 
         // Store the new extended transactions into the History tree.
-        self.history_store.add_to_history(
+        this.history_store.add_to_history(
             &mut txn,
             policy::epoch_at(block.block_number()),
             &ext_txs[first_new_ext_tx..],
@@ -323,36 +298,31 @@ impl Blockchain {
         // Check if this block is an election block.
         let is_election_block = macro_block.is_election_block();
 
-        // Get a write transaction to the current state.
-        drop(state);
-        let mut state = self.state.write();
+        let mut this = RwLockUpgradableReadGuard::upgrade(this);
 
         // Update the blockchain state.
-        state.main_chain = chain_info.clone();
-        state.head_hash = block_hash.clone();
-        state.macro_info = chain_info;
-        state.macro_head_hash = block_hash.clone();
+        this.state.main_chain = chain_info.clone();
+        this.state.head_hash = block_hash.clone();
+        this.state.macro_info = chain_info;
+        this.state.macro_head_hash = block_hash.clone();
 
         if is_election_block {
-            state.election_head = macro_block.clone();
-            state.election_head_hash = block_hash.clone();
-            state.previous_slots = state.current_slots.take();
-            state.current_slots = macro_block.get_validators();
+            this.state.election_head = macro_block.clone();
+            this.state.election_head_hash = block_hash.clone();
+            this.state.previous_slots = this.state.current_slots.take();
+            this.state.current_slots = macro_block.get_validators();
         }
 
         // Give up database transactions and push lock before creating notifications.
         txn.commit();
-        drop(state);
-        drop(push_lock);
+
+        let this = RwLockWriteGuard::downgrade(this);
 
         if is_election_block {
-            self.notifier
-                .read()
+            this.notifier
                 .notify(BlockchainEvent::EpochFinalized(block_hash));
         } else {
-            self.notifier
-                .read()
-                .notify(BlockchainEvent::Finalized(block_hash));
+            this.notifier.notify(BlockchainEvent::Finalized(block_hash));
         }
 
         // Return result.
@@ -365,12 +335,9 @@ impl Blockchain {
         num_blocks: u32,
         write_txn: &mut WriteTransaction,
     ) -> Result<(), PushError> {
-        // Gets an upgradeable read transaction to the blockchain state.
-        let state = self.state.upgradable_read();
-
         // Get the chain info for the head of the chain.
         let mut current_info = self
-            .get_chain_info(&self.head_hash(), true, Some(&write_txn))
+            .get_chain_info(&self.head_hash(), true, Some(write_txn))
             .expect("Couldn't fetch chain info for the head of the chain!");
 
         // Revert each block individually.
@@ -379,14 +346,14 @@ impl Blockchain {
                 Block::Micro(ref micro_block) => {
                     // Get the chain info for the parent of the current head of the chain.
                     let prev_info = self
-                        .get_chain_info(&micro_block.header.parent_hash, true, Some(&write_txn))
+                        .get_chain_info(&micro_block.header.parent_hash, true, Some(write_txn))
                         .expect("Failed to find main chain predecessor while reverting blocks!");
 
                     // Revert the accounts tree. This also reverts the history store.
                     self.revert_accounts(
-                        &state.accounts,
+                        &self.state.accounts,
                         write_txn,
-                        &micro_block,
+                        micro_block,
                         prev_info.head.view_number(),
                     )?;
 

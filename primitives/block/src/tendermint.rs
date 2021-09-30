@@ -1,17 +1,18 @@
-use crate::signed::{
-    Message, SignedMessage, PREFIX_TENDERMINT_COMMIT, PREFIX_TENDERMINT_PREPARE,
-    PREFIX_TENDERMINT_PROPOSAL,
-};
-use crate::{MacroHeader, MultiSignature};
+use std::io;
+
 use beserial::{Deserialize, Serialize};
 use nimiq_bls::AggregatePublicKey;
 use nimiq_hash::{Blake2bHash, Hash, SerializeContent};
 use nimiq_hash_derive::SerializeContent;
 use nimiq_nano_primitives::pk_tree_construct;
-use nimiq_network_interface::message::Message as NetworkMessage;
 use nimiq_primitives::policy::TWO_THIRD_SLOTS;
 use nimiq_primitives::slots::Validators;
-use std::io;
+
+use crate::signed::{
+    Message, SignedMessage, PREFIX_TENDERMINT_COMMIT, PREFIX_TENDERMINT_PREPARE,
+    PREFIX_TENDERMINT_PROPOSAL,
+};
+use crate::{MacroHeader, MultiSignature};
 
 /// The proposal message sent by the Tendermint leader.
 #[derive(Clone, Debug, Serialize, Deserialize, SerializeContent, PartialEq, Eq)]
@@ -27,10 +28,6 @@ impl Message for TendermintProposal {
 }
 
 pub type SignedTendermintProposal = SignedMessage<TendermintProposal>;
-
-impl NetworkMessage for SignedTendermintProposal {
-    const TYPE_ID: u64 = 666;
-}
 
 /// The proof for a block produced by Tendermint.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,7 +69,7 @@ impl TendermintProof {
 
         for (i, pk) in pks.iter().enumerate() {
             if self.sig.signers.contains(i as usize) {
-                agg_pk.aggregate(&pk);
+                agg_pk.aggregate(pk);
             }
 
             raw_pks.push(pk.public_key);

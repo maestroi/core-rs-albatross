@@ -1,9 +1,13 @@
 use beserial::{Deserialize, Serialize};
-use primitives::coin::Coin;
-use transaction::Transaction;
+use nimiq_database::WriteTransaction;
+use nimiq_primitives::account::AccountType;
+use nimiq_primitives::coin::Coin;
+use nimiq_transaction::Transaction;
+use nimiq_trie::key_nibbles::KeyNibbles;
 
-use crate::inherent::{AccountInherentInteraction, Inherent, InherentType};
-use crate::{Account, AccountError, AccountTransactionInteraction, AccountType};
+use crate::inherent::{Inherent, InherentType};
+use crate::interaction_traits::{AccountInherentInteraction, AccountTransactionInteraction};
+use crate::{Account, AccountError, AccountsTrie};
 
 #[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
@@ -12,130 +16,231 @@ pub struct BasicAccount {
 }
 
 impl AccountTransactionInteraction for BasicAccount {
-    fn new_contract(
-        _account_type: AccountType,
-        _balance: Coin,
-        _transaction: &Transaction,
-        _block_height: u32,
-        _time: u64,
-    ) -> Result<Self, AccountError> {
-        Err(AccountError::InvalidForRecipient)
-    }
-
     fn create(
-        _balance: Coin,
+        _accounts_tree: &AccountsTrie,
+        _db_txn: &mut WriteTransaction,
         _transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
-    ) -> Result<Self, AccountError> {
-        Err(AccountError::InvalidForRecipient)
-    }
-
-    fn check_incoming_transaction(
-        _transaction: &Transaction,
-        _block_height: u32,
-        _time: u64,
+        _block_time: u64,
     ) -> Result<(), AccountError> {
-        Ok(())
+        Err(AccountError::InvalidForRecipient)
     }
 
     fn commit_incoming_transaction(
-        &mut self,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
     ) -> Result<Option<Vec<u8>>, AccountError> {
-        self.balance = Account::balance_add(self.balance, transaction.value)?;
+        let key = KeyNibbles::from(&transaction.recipient);
+
+        let leaf = accounts_tree.get(db_txn, &key);
+
+        // Implicitly also checks that the address is in fact from a basic account.
+        let current_balance = match leaf {
+            Some(Account::Basic(account)) => account.balance,
+            None => Coin::ZERO,
+            _ => {
+                return Err(AccountError::TypeMismatch {
+                    expected: AccountType::Basic,
+                    got: leaf.unwrap().account_type(),
+                })
+            }
+        };
+
+        let new_balance = Account::balance_add(current_balance, transaction.value)?;
+
+        accounts_tree.put(
+            db_txn,
+            &key,
+            Account::Basic(BasicAccount {
+                balance: new_balance,
+            }),
+        );
+
         Ok(None)
     }
 
     fn revert_incoming_transaction(
-        &mut self,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
         receipt: Option<&Vec<u8>>,
     ) -> Result<(), AccountError> {
         if receipt.is_some() {
             return Err(AccountError::InvalidReceipt);
         }
 
-        self.balance = Account::balance_sub(self.balance, transaction.value)?;
+        let key = KeyNibbles::from(&transaction.recipient);
+
+        let account = accounts_tree
+            .get(db_txn, &key)
+            .ok_or(AccountError::NonExistentAddress {
+                address: transaction.recipient.clone(),
+            })?;
+
+        let new_balance = Account::balance_sub(account.balance(), transaction.value)?;
+
+        if new_balance.is_zero() {
+            accounts_tree.remove(db_txn, &key);
+        } else {
+            accounts_tree.put(
+                db_txn,
+                &key,
+                Account::Basic(BasicAccount {
+                    balance: new_balance,
+                }),
+            );
+        }
+
         Ok(())
     }
 
-    fn check_outgoing_transaction(
-        &self,
-        transaction: &Transaction,
-        _block_height: u32,
-        _time: u64,
-    ) -> Result<(), AccountError> {
-        Account::balance_sufficient(self.balance, transaction.total_value()?)
-    }
-
     fn commit_outgoing_transaction(
-        &mut self,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
     ) -> Result<Option<Vec<u8>>, AccountError> {
-        self.balance = Account::balance_sub(self.balance, transaction.total_value()?)?;
+        let key = KeyNibbles::from(&transaction.sender);
+
+        let account = accounts_tree
+            .get(db_txn, &key)
+            .ok_or(AccountError::NonExistentAddress {
+                address: transaction.sender.clone(),
+            })?;
+
+        if account.account_type() != AccountType::Basic {
+            return Err(AccountError::TypeMismatch {
+                expected: AccountType::Basic,
+                got: account.account_type(),
+            });
+        }
+
+        let new_balance = Account::balance_sub(account.balance(), transaction.total_value()?)?;
+
+        if new_balance.is_zero() {
+            accounts_tree.remove(db_txn, &key);
+        } else {
+            accounts_tree.put(
+                db_txn,
+                &key,
+                Account::Basic(BasicAccount {
+                    balance: new_balance,
+                }),
+            );
+        }
+
         Ok(None)
     }
 
     fn revert_outgoing_transaction(
-        &mut self,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
         receipt: Option<&Vec<u8>>,
     ) -> Result<(), AccountError> {
         if receipt.is_some() {
             return Err(AccountError::InvalidReceipt);
         }
 
-        self.balance = Account::balance_add(self.balance, transaction.total_value()?)?;
+        let key = KeyNibbles::from(&transaction.sender);
+
+        let leaf = accounts_tree.get(db_txn, &key);
+
+        let current_balance = match leaf {
+            None => Coin::ZERO,
+            Some(account) => account.balance(),
+        };
+
+        let new_balance = Account::balance_add(current_balance, transaction.total_value()?)?;
+
+        accounts_tree.put(
+            db_txn,
+            &key,
+            Account::Basic(BasicAccount {
+                balance: new_balance,
+            }),
+        );
+
         Ok(())
     }
 }
 
 impl AccountInherentInteraction for BasicAccount {
-    fn check_inherent(
-        &self,
+    fn commit_inherent(
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         inherent: &Inherent,
         _block_height: u32,
-        _time: u64,
-    ) -> Result<(), AccountError> {
-        match inherent.ty {
-            InherentType::Reward => Ok(()),
-            _ => Err(AccountError::InvalidInherent),
-        }
-    }
-
-    fn commit_inherent(
-        &mut self,
-        inherent: &Inherent,
-        block_height: u32,
-        time: u64,
+        _block_time: u64,
     ) -> Result<Option<Vec<u8>>, AccountError> {
-        self.check_inherent(inherent, block_height, time)?;
-        self.balance = Account::balance_add(self.balance, inherent.value)?;
+        if inherent.ty != InherentType::Reward {
+            return Err(AccountError::InvalidInherent);
+        }
+
+        let key = KeyNibbles::from(&inherent.target);
+
+        let leaf = accounts_tree.get(db_txn, &key);
+
+        let current_balance = match leaf {
+            None => Coin::ZERO,
+            Some(account) => account.balance(),
+        };
+
+        let new_balance = Account::balance_add(current_balance, inherent.value)?;
+
+        accounts_tree.put(
+            db_txn,
+            &key,
+            Account::Basic(BasicAccount {
+                balance: new_balance,
+            }),
+        );
+
         Ok(None)
     }
 
     fn revert_inherent(
-        &mut self,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         inherent: &Inherent,
-        block_height: u32,
-        time: u64,
+        _block_height: u32,
+        _block_time: u64,
         receipt: Option<&Vec<u8>>,
     ) -> Result<(), AccountError> {
         if receipt.is_some() {
             return Err(AccountError::InvalidReceipt);
         }
 
-        self.check_inherent(inherent, block_height, time)?;
-        self.balance = Account::balance_sub(self.balance, inherent.value)?;
+        if inherent.ty != InherentType::Reward {
+            return Err(AccountError::InvalidInherent);
+        }
+
+        let key = KeyNibbles::from(&inherent.target);
+
+        let account = accounts_tree
+            .get(db_txn, &key)
+            .ok_or(AccountError::NonExistentAddress {
+                address: inherent.target.clone(),
+            })?;
+
+        let new_balance = Account::balance_sub(account.balance(), inherent.value)?;
+
+        accounts_tree.put(
+            db_txn,
+            &key,
+            Account::Basic(BasicAccount {
+                balance: new_balance,
+            }),
+        );
+
         Ok(())
     }
 }

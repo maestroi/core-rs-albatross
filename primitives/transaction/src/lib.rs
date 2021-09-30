@@ -11,6 +11,7 @@ extern crate nimiq_utils as utils;
 extern crate strum_macros;
 
 use std::cmp::{Ord, Ordering};
+use std::convert::TryFrom;
 use std::io;
 use std::sync::Arc;
 
@@ -31,7 +32,6 @@ use primitives::networks::NetworkId;
 use primitives::policy;
 
 use crate::account::AccountTransactionVerification;
-use std::convert::TryFrom;
 
 pub mod account;
 
@@ -116,8 +116,18 @@ impl SignatureProof {
         self.compute_signer() == *address
     }
 
-    pub fn verify(&self, data: &[u8]) -> bool {
-        self.public_key.verify(&self.signature, data)
+    pub fn verify(&self, message: &[u8]) -> bool {
+        self.public_key.verify(&self.signature, message)
+    }
+}
+
+impl Default for SignatureProof {
+    fn default() -> Self {
+        SignatureProof {
+            public_key: Default::default(),
+            merkle_path: Default::default(),
+            signature: Signature::from_bytes(&[0u8; Signature::SIZE]).unwrap(),
+        }
     }
 }
 
@@ -248,28 +258,6 @@ impl Transaction {
         tx
     }
 
-    pub fn new_reward(
-        recipient: Address,
-        value: Coin,
-        validity_start_height: u32,
-        network_id: NetworkId,
-    ) -> Self {
-        Self {
-            data: Vec::new(),
-            sender: Address::from([0u8; Address::SIZE]),
-            sender_type: AccountType::Reward,
-            recipient,
-            recipient_type: AccountType::Basic,
-            value,
-            fee: Coin::ZERO,
-            validity_start_height,
-            network_id,
-            flags: TransactionFlags::empty(),
-            proof: Vec::new(),
-            valid: false,
-        }
-    }
-
     pub fn format(&self) -> TransactionFormat {
         if self.sender_type == AccountType::Basic
             && self.recipient_type == AccountType::Basic
@@ -337,10 +325,6 @@ impl Transaction {
             return Err(TransactionError::ForeignNetwork);
         }
 
-        // Check that sender != recipient.
-        // This is no longer true for stake retire transactions.
-        // Check moved to AccountType::verify_incoming_transaction()
-
         // Check that value > 0 except if it is a signalling transaction..
         if self.flags.contains(TransactionFlags::SIGNALLING) {
             if self.value != Coin::ZERO {
@@ -361,10 +345,10 @@ impl Transaction {
         }
 
         // Check transaction validity for sender account.
-        AccountType::verify_outgoing_transaction(&self)?;
+        AccountType::verify_outgoing_transaction(self)?;
 
         // Check transaction validity for recipient account.
-        AccountType::verify_incoming_transaction(&self)?;
+        AccountType::verify_incoming_transaction(self)?;
 
         Ok(())
     }
@@ -576,6 +560,8 @@ pub enum TransactionError {
     ForeignNetwork,
     #[error("Transaction has 0 value")]
     ZeroValue,
+    #[error("Transaction has invalid value")]
+    InvalidValue,
     #[error("Overflow")]
     Overflow,
     #[error("Sender same as recipient")]

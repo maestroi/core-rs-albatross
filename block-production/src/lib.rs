@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use nimiq_account::Inherent;
 use nimiq_block::{
     ForkProof, MacroBlock, MacroBody, MacroHeader, MicroBlock, MicroBody, MicroHeader,
@@ -15,14 +17,18 @@ use nimiq_primitives::policy;
 /// blockchain store and state, the current mempool for this validator and the validator key for
 /// this validator.
 pub struct BlockProducer {
-    pub blockchain: Arc<Blockchain>,
+    pub blockchain: Arc<RwLock<Blockchain>>,
     pub mempool: Option<Arc<Mempool>>,
     pub validator_key: KeyPair,
 }
 
 impl BlockProducer {
     /// Creates a new BlockProducer struct given a blockchain, a mempool and a validator key.
-    pub fn new(blockchain: Arc<Blockchain>, mempool: Arc<Mempool>, validator_key: KeyPair) -> Self {
+    pub fn new(
+        blockchain: Arc<RwLock<Blockchain>>,
+        mempool: Arc<Mempool>,
+        validator_key: KeyPair,
+    ) -> Self {
         BlockProducer {
             blockchain,
             mempool: Some(mempool),
@@ -31,7 +37,10 @@ impl BlockProducer {
     }
 
     /// Creates a new BlockProducer struct without a mempool given a blockchain and a validator key.
-    pub fn new_without_mempool(blockchain: Arc<Blockchain>, validator_key: KeyPair) -> Self {
+    pub fn new_without_mempool(
+        blockchain: Arc<RwLock<Blockchain>>,
+        validator_key: KeyPair,
+    ) -> Self {
         BlockProducer {
             blockchain,
             mempool: None,
@@ -56,20 +65,20 @@ impl BlockProducer {
         // Extra data for this block. It has no a priori use.
         extra_data: Vec<u8>,
     ) -> MicroBlock {
+        let blockchain = self.blockchain.read();
         // Calculate the block number. It is simply the previous block number incremented by one.
-        let block_number = self.blockchain.block_number() + 1;
+        let block_number = blockchain.block_number() + 1;
 
         // Calculate the timestamp. It must be greater than or equal to the previous block
         // timestamp (i.e. time must not go back).
-        let timestamp = u64::max(timestamp, self.blockchain.head().timestamp());
+        let timestamp = u64::max(timestamp, blockchain.head().timestamp());
 
         // Get the hash of the latest block. It can be any block type.
-        let parent_hash = self.blockchain.head_hash();
+        let parent_hash = blockchain.head_hash();
 
         // Calculate the seed for this block by signing the previous block seed with the validator
         // key.
-        let seed = self
-            .blockchain
+        let seed = blockchain
             .head()
             .seed()
             .sign_next(&self.validator_key.secret_key);
@@ -91,36 +100,44 @@ impl BlockProducer {
 
         // Creates a new ViewChanges struct.
         let view_changes = ViewChanges::new(
-            self.blockchain.block_number() + 1,
-            self.blockchain.next_view_number(),
+            blockchain.block_number() + 1,
+            blockchain.next_view_number(),
             view_number,
         );
 
         // Create the inherents from the fork proofs and the view changes.
-        let inherents = self
-            .blockchain
-            .create_slash_inherents(&fork_proofs, &view_changes, None);
+        let inherents = blockchain.create_slash_inherents(&fork_proofs, &view_changes, None);
 
         // Update the state and calculate the state root.
-        let state_root = self
-            .blockchain
+        let state_root = blockchain
             .state()
             .accounts
-            .hash_with(&transactions, &inherents, block_number, timestamp)
+            .get_root_with(&transactions, &inherents, block_number, timestamp)
             .expect("Failed to compute accounts hash during block production");
 
         // Calculate the extended transactions from the transactions and the inherents.
-        let ext_txs =
-            ExtendedTransaction::from(block_number, timestamp, transactions.clone(), inherents);
+        let ext_txs = ExtendedTransaction::from(
+            blockchain.network_id,
+            block_number,
+            timestamp,
+            transactions.clone(),
+            inherents,
+        );
 
         // Store the extended transactions into the history tree and calculate the history root.
-        let mut txn = self.blockchain.write_transaction();
+        let mut txn = blockchain.write_transaction();
 
-        let history_root = self
-            .blockchain
+        let history_root = blockchain
             .history_store
             .add_to_history(&mut txn, policy::epoch_at(block_number), &ext_txs)
             .expect("Failed to compute history root during block production.");
+
+        // Not strictly necessary to drop the lock here, but sign as well as compress might be somewhat expensive
+        // and there is no need to hold the lock after this point.
+        // Abort txn so that blockchain is no longer borrowed.
+        txn.abort();
+        // Drop the read lock as it is no longer necessary.
+        drop(blockchain);
 
         // Create the micro block body.
         let body = MicroBody {
@@ -169,23 +186,23 @@ impl BlockProducer {
         // Extra data for this block. It has no a priori use.
         extra_data: Vec<u8>,
     ) -> MacroBlock {
+        let blockchain = self.blockchain.read();
         // Calculate the block number. It is simply the previous block number incremented by one.
-        let block_number = self.blockchain.block_number() + 1;
+        let block_number = blockchain.block_number() + 1;
 
         // Calculate the timestamp. It must be greater than or equal to the previous block
         // timestamp (i.e. time must not go back).
-        let timestamp = u64::max(timestamp, self.blockchain.head().timestamp());
+        let timestamp = u64::max(timestamp, blockchain.head().timestamp());
 
         // Get the hash of the latest block (it is by definition a micro block).
-        let parent_hash = self.blockchain.head_hash();
+        let parent_hash = blockchain.head_hash();
 
         // Get the hash of the latest election macro block.
-        let parent_election_hash = self.blockchain.election_head_hash();
+        let parent_election_hash = blockchain.election_head_hash();
 
         // Calculate the seed for this block by signing the previous block seed with the validator
         // key.
-        let seed = self
-            .blockchain
+        let seed = blockchain
             .head()
             .seed()
             .sign_next(&self.validator_key.secret_key);
@@ -208,48 +225,48 @@ impl BlockProducer {
         };
 
         // Get the state.
-        let state = self.blockchain.state();
+        let state = blockchain.state();
 
-        let inherents: Vec<Inherent> = self
-            .blockchain
-            .create_macro_block_inherents(&state, &header);
-
-        let transactions = self.blockchain.create_txs_from_inherents(&inherents);
+        let inherents: Vec<Inherent> = blockchain.create_macro_block_inherents(&state, &header);
 
         // Update the state and add the state root to the header.
         header.state_root = state
             .accounts
-            .hash_with(&[], &inherents, block_number, timestamp)
+            .get_root_with(&[], &inherents, block_number, timestamp)
             .expect("Failed to compute accounts hash during block production.");
 
         // Calculate the extended transactions from the transactions and the inherents.
-        let ext_txs =
-            ExtendedTransaction::from(block_number, timestamp, transactions.clone(), inherents);
+        let ext_txs = ExtendedTransaction::from(
+            blockchain.network_id,
+            block_number,
+            timestamp,
+            vec![],
+            inherents,
+        );
 
         // Store the extended transactions into the history tree and calculate the history root.
-        let mut txn = self.blockchain.write_transaction();
+        let mut txn = blockchain.write_transaction();
 
-        header.history_root = self
-            .blockchain
+        header.history_root = blockchain
             .history_store
             .add_to_history(&mut txn, policy::epoch_at(block_number), &ext_txs)
             .expect("Failed to compute history root during block production.");
 
         // Calculate the disabled set for the current validator set.
-        let disabled_set = self
-            .blockchain
-            .get_staking_contract()
-            .previous_disabled_slots();
+        // Note: We are fetching the previous disabled set here because we have already updated the
+        // state. So the staking contract has already moved the disabled set for this batch into the
+        // previous disabled set.
+        let disabled_set = blockchain.get_staking_contract().previous_disabled_slots();
 
         // Calculate the lost reward set for the current validator set.
-        let lost_reward_set = self
-            .blockchain
-            .get_staking_contract()
-            .previous_lost_rewards();
+        // Note: We are fetching the previous lost rewards set here because we have already updated the
+        // state. So the staking contract has already moved the lost rewards set for this batch into the
+        // previous lost rewards set.
+        let lost_reward_set = blockchain.get_staking_contract().previous_lost_rewards();
 
         // If this is an election block, calculate the validator set for the next epoch.
-        let validators = if policy::is_election_block_at(self.blockchain.block_number() + 1) {
-            Some(self.blockchain.next_validators(&header.seed))
+        let validators = if policy::is_election_block_at(blockchain.block_number() + 1) {
+            Some(blockchain.next_validators(&header.seed))
         } else {
             None
         };
@@ -259,7 +276,7 @@ impl BlockProducer {
             validators,
             lost_reward_set,
             disabled_set,
-            transactions,
+            transactions: vec![],
         };
 
         // Add the root of the body to the header.

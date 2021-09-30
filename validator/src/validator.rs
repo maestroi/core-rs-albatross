@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 
 use block::{Block, BlockType, SignedTendermintProposal, ViewChange, ViewChangeProof};
-use blockchain::{AbstractBlockchain, BlockchainEvent, ForkEvent, PushResult};
+use blockchain::{AbstractBlockchain, Blockchain, BlockchainEvent, ForkEvent, PushResult};
 use bls::CompressedPublicKey;
 use consensus::{sync::block_queue::BlockTopic, Consensus, ConsensusEvent, ConsensusProxy};
 use database::{Database, Environment, ReadTransaction, WriteTransaction};
@@ -33,13 +33,9 @@ pub struct ProposalTopic;
 impl Topic for ProposalTopic {
     type Item = SignedTendermintProposal;
 
-    fn topic(&self) -> String {
-        "tendermint-proposal".to_owned()
-    }
-
-    fn validate(&self) -> bool {
-        true
-    }
+    const BUFFER_SIZE: usize = 8;
+    const NAME: &'static str = "tendermint-proposal";
+    const VALIDATE: bool = true;
 }
 
 enum ValidatorStakingState {
@@ -74,7 +70,7 @@ pub struct Validator<TNetwork: Network, TValidatorNetwork: ValidatorNetwork + 's
 
     proposal_receiver: ProposalReceiver<TValidatorNetwork>,
 
-    consensus_event_rx: BroadcastStream<ConsensusEvent<TNetwork>>,
+    consensus_event_rx: BroadcastStream<ConsensusEvent>,
     blockchain_event_rx: UnboundedReceiverStream<BlockchainEvent>,
     fork_event_rx: UnboundedReceiverStream<ForkEvent>,
 
@@ -103,17 +99,20 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
         wallet_key: Option<keys::KeyPair>,
     ) -> Self {
         let consensus_event_rx = consensus.subscribe_events();
-        let blockchain_event_rx = consensus.blockchain.notifier.write().as_stream();
-        let fork_event_rx = consensus.blockchain.fork_notifier.write().as_stream();
+
+        let mut blockchain = consensus.blockchain.write();
+        let blockchain_event_rx = blockchain.notifier.as_stream();
+        let fork_event_rx = blockchain.fork_notifier.as_stream();
+
+        let micro_state = ProduceMicroBlockState {
+            view_number: blockchain.view_number(),
+            view_change_proof: None,
+            view_change: None,
+        };
+        drop(blockchain);
 
         let blockchain_state = BlockchainState {
             fork_proofs: ForkProofPool::new(),
-        };
-
-        let micro_state = ProduceMicroBlockState {
-            view_number: consensus.blockchain.view_number(),
-            view_change_proof: None,
-            view_change: None,
         };
 
         let env = consensus.env.clone();
@@ -154,7 +153,7 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
 
         tokio::spawn(async move {
             network1
-                .subscribe(&ProposalTopic)
+                .subscribe::<ProposalTopic>()
                 .await
                 .expect("Failed to subscribe to proposal topic")
                 .for_each(|proposal| async { proposal_sender.send(proposal) })
@@ -176,7 +175,12 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
         self.macro_producer = None;
         self.micro_producer = None;
 
-        let validators = self.consensus.blockchain.current_validators().unwrap();
+        let validators = self
+            .consensus
+            .blockchain
+            .read()
+            .current_validators()
+            .unwrap();
 
         // TODO: This code block gets this validators position in the validators struct by searching it
         //  with its public key. This is an insane way of doing this. Just start saving the validator
@@ -213,23 +217,23 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
     }
 
     fn init_block_producer(&mut self) {
-        log::debug!("Initializing block producer");
+        log::trace!("Initializing block producer");
 
         if !self.is_active() {
             log::debug!("Validator not active");
             return;
         }
 
-        let _lock = self.consensus.blockchain.lock();
+        let blockchain = self.consensus.blockchain.read();
 
         self.macro_producer = None;
         self.micro_producer = None;
 
-        match self.consensus.blockchain.get_next_block_type(None) {
+        match blockchain.get_next_block_type(None) {
             BlockType::Macro => {
                 let block_producer = BlockProducer::new(
-                    self.consensus.blockchain.clone(),
-                    self.consensus.mempool.clone(),
+                    Arc::clone(&self.consensus.blockchain),
+                    Arc::clone(&self.consensus.mempool),
                     self.signing_key.clone(),
                 );
 
@@ -241,7 +245,7 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
                     .macro_state
                     .take()
                     .map(|state| {
-                        if state.height == self.consensus.blockchain.block_number() + 1 {
+                        if state.height == blockchain.block_number() + 1 {
                             Some(state)
                         } else {
                             None
@@ -252,8 +256,8 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
                 let proposal_stream = self.proposal_receiver.clone().boxed();
 
                 self.macro_producer = Some(ProduceMacroBlock::new(
-                    self.consensus.blockchain.clone(),
-                    self.network.clone(),
+                    Arc::clone(&self.consensus.blockchain),
+                    Arc::clone(&self.network),
                     block_producer,
                     self.signing_key.clone(),
                     self.validator_id(),
@@ -263,7 +267,7 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
             }
             BlockType::Micro => {
                 self.micro_state = ProduceMicroBlockState {
-                    view_number: self.consensus.blockchain.head().next_view_number(),
+                    view_number: blockchain.head().next_view_number(),
                     view_change_proof: None,
                     view_change: None,
                 };
@@ -308,6 +312,7 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
         let block = self
             .consensus
             .blockchain
+            .read()
             .get_block(hash, true, None)
             .expect("Head block not found");
         self.blockchain_state.fork_proofs.apply_block(&block);
@@ -322,7 +327,7 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
             self.blockchain_state.fork_proofs.revert_block(block);
         }
         for (_hash, block) in new_chain.iter() {
-            self.blockchain_state.fork_proofs.apply_block(&block);
+            self.blockchain_state.fork_proofs.apply_block(block);
         }
     }
 
@@ -340,12 +345,14 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
                 TendermintReturn::Result(block) => {
                     // If the event is a result meaning the next macro block was produced we push it onto our local chain
                     let block_copy = block.clone();
-                    let result = self
-                        .consensus
-                        .blockchain
-                        .push(Block::Macro(block))
-                        .map_err(|e| error!("Failed to push macro block onto the chain: {:?}", e))
-                        .ok();
+
+                    let result = Blockchain::push(
+                        self.consensus.blockchain.upgradable_read(),
+                        Block::Macro(block),
+                    )
+                    .map_err(|e| error!("Failed to push macro block onto the chain: {:?}", e))
+                    .ok();
+
                     if result == Some(PushResult::Extended)
                         || result == Some(PushResult::Rebranched)
                     {
@@ -366,9 +373,9 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
                         tokio::spawn(async move {
                             trace!("publishing macro block: {:?}", &block_copy);
                             network
-                                .publish(&BlockTopic, Block::Macro(block_copy))
+                                .publish::<BlockTopic>(Block::Macro(block_copy))
                                 .await
-                                .map_err(|e| error!("Failed to publish block: {:?}", e))
+                                .map_err(|e| trace!("Failed to publish block: {:?}", e))
                                 .ok();
                         });
                     }
@@ -377,7 +384,7 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
                 TendermintReturn::StateUpdate(update) => {
                     let mut write_transaction = WriteTransaction::new(&self.env);
                     let persistable_state = PersistedMacroState::<TValidatorNetwork> {
-                        height: self.consensus.blockchain.block_number() + 1,
+                        height: self.consensus.blockchain.read().block_number() + 1,
                         step: update.step.into(),
                         round: update.round,
                         locked_round: update.locked_round,
@@ -406,12 +413,13 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
             match event {
                 ProduceMicroBlockEvent::MicroBlock(block) => {
                     let block_copy = block.clone();
-                    let result = self
-                        .consensus
-                        .blockchain
-                        .push(Block::Micro(block))
-                        .map_err(|e| error!("Failed to push our block onto the chain: {:?}", e))
-                        .ok();
+                    let result = Blockchain::push(
+                        self.consensus.blockchain.upgradable_read(),
+                        Block::Micro(block),
+                    )
+                    .map_err(|e| error!("Failed to push our block onto the chain: {:?}", e))
+                    .ok();
+
                     if result == Some(PushResult::Extended)
                         || result == Some(PushResult::Rebranched)
                     {
@@ -420,11 +428,11 @@ impl<TNetwork: Network, TValidatorNetwork: ValidatorNetwork>
                         tokio::spawn(async move {
                             trace!("publishing micro block: {:?}", &block_copy);
                             if nw
-                                .publish(&BlockTopic, Block::Micro(block_copy))
+                                .publish::<BlockTopic>(Block::Micro(block_copy))
                                 .await
                                 .is_err()
                             {
-                                error!("Failed to publish Block");
+                                trace!("Failed to publish Block");
                             }
                         });
                     }
@@ -530,7 +538,9 @@ impl<TValidatorNetwork: ValidatorNetwork + 'static> ProposalSender<TValidatorNet
         let source = proposal.1.propagation_source();
         let mut shared = self.shared.write();
         shared.buffer.insert(source, proposal);
-        shared.waker.take().map(|waker| waker.wake());
+        if let Some(waker) = shared.waker.take() {
+            waker.wake()
+        }
     }
 }
 

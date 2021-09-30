@@ -1,22 +1,22 @@
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::task::{Context, Poll};
 use futures::{future::BoxFuture, stream::BoxStream, Future, FutureExt, StreamExt};
+use parking_lot::RwLock;
 use tokio::sync::broadcast::{channel as broadcast, Sender as BroadcastSender};
 use tokio::time::Sleep;
 use tokio_stream::wrappers::BroadcastStream;
 
-use blockchain::Blockchain;
+use blockchain::{AbstractBlockchain, Blockchain};
 use database::Environment;
 use mempool::{Mempool, ReturnCode};
 use network_interface::network::{MsgAcceptance, Network, Topic};
 use transaction::Transaction;
 
 use crate::consensus::head_requests::{HeadRequests, HeadRequestsResult};
-use crate::consensus_agent::ConsensusAgent;
 use crate::sync::block_queue::{BlockQueue, BlockQueueConfig, BlockQueueEvent};
 use crate::sync::request_component::{BlockRequestComponent, HistorySyncStream};
 
@@ -29,17 +29,13 @@ pub struct TransactionTopic;
 impl Topic for TransactionTopic {
     type Item = Transaction;
 
-    fn topic(&self) -> String {
-        "transactions".to_owned()
-    }
-
-    fn validate(&self) -> bool {
-        true
-    }
+    const BUFFER_SIZE: usize = 1024;
+    const NAME: &'static str = "transactions";
+    const VALIDATE: bool = true;
 }
 
 pub struct ConsensusProxy<N: Network> {
-    pub blockchain: Arc<Blockchain>,
+    pub blockchain: Arc<RwLock<Blockchain>>,
     pub network: Arc<N>,
     pub mempool: Arc<Mempool>,
     established_flag: Arc<AtomicBool>,
@@ -64,7 +60,7 @@ impl<N: Network> ConsensusProxy<N> {
         }
 
         self.network
-            .publish(&TransactionTopic::default(), tx)
+            .publish::<TransactionTopic>(tx)
             .await
             .map(|_| ReturnCode::Accepted)
     }
@@ -74,26 +70,14 @@ impl<N: Network> ConsensusProxy<N> {
     }
 }
 
-pub enum ConsensusEvent<N: Network> {
-    PeerMacroSynced(Weak<ConsensusAgent<N::PeerType>>),
-    PeerLeft,
+#[derive(Clone)]
+pub enum ConsensusEvent {
     Established,
     Lost,
 }
 
-impl<N: Network> Clone for ConsensusEvent<N> {
-    fn clone(&self) -> Self {
-        match self {
-            ConsensusEvent::PeerMacroSynced(peer) => ConsensusEvent::PeerMacroSynced(peer.clone()),
-            ConsensusEvent::Established => ConsensusEvent::Established,
-            ConsensusEvent::Lost => ConsensusEvent::Lost,
-            ConsensusEvent::PeerLeft => ConsensusEvent::PeerLeft,
-        }
-    }
-}
-
 pub struct Consensus<N: Network> {
-    pub blockchain: Arc<Blockchain>,
+    pub blockchain: Arc<RwLock<Blockchain>>,
     pub mempool: Arc<Mempool>,
     pub network: Arc<N>,
     pub env: Environment,
@@ -104,7 +88,7 @@ pub struct Consensus<N: Network> {
     /// A Delay which exists purely for the waker on its poll to reactivate the task running Consensus::poll
     next_execution_timer: Option<Pin<Box<Sleep>>>,
 
-    events: BroadcastSender<ConsensusEvent<N>>,
+    events: BroadcastSender<ConsensusEvent>,
     established_flag: Arc<AtomicBool>,
     head_requests: Option<HeadRequests<N::PeerType>>,
     head_requests_time: Option<Instant>,
@@ -129,7 +113,7 @@ impl<N: Network> Consensus<N> {
 
     pub async fn from_network(
         env: Environment,
-        blockchain: Arc<Blockchain>,
+        blockchain: Arc<RwLock<Blockchain>>,
         mempool: Arc<Mempool>,
         network: Arc<N>,
         sync_protocol: Pin<Box<dyn HistorySyncStream<N::PeerType>>>,
@@ -147,7 +131,7 @@ impl<N: Network> Consensus<N> {
 
     pub async fn with_min_peers(
         env: Environment,
-        blockchain: Arc<Blockchain>,
+        blockchain: Arc<RwLock<Blockchain>>,
         mempool: Arc<Mempool>,
         network: Arc<N>,
         sync_protocol: Pin<Box<dyn HistorySyncStream<N::PeerType>>>,
@@ -165,7 +149,7 @@ impl<N: Network> Consensus<N> {
         .await;
 
         let tx_stream = network
-            .subscribe::<TransactionTopic>(&TransactionTopic::default())
+            .subscribe::<TransactionTopic>()
             .await
             .unwrap()
             .boxed();
@@ -183,7 +167,7 @@ impl<N: Network> Consensus<N> {
 
     pub fn new(
         env: Environment,
-        blockchain: Arc<Blockchain>,
+        blockchain: Arc<RwLock<Blockchain>>,
         mempool: Arc<Mempool>,
         network: Arc<N>,
         block_queue: BlockQueue<N, BlockRequestComponent<N::PeerType>>,
@@ -242,7 +226,7 @@ impl<N: Network> Consensus<N> {
         }
     }
 
-    pub fn subscribe_events(&self) -> BroadcastStream<ConsensusEvent<N>> {
+    pub fn subscribe_events(&self) -> BroadcastStream<ConsensusEvent> {
         BroadcastStream::new(self.events.subscribe())
     }
 
@@ -289,7 +273,7 @@ impl<N: Network> Consensus<N> {
     fn set_established(
         &mut self,
         finished_head_request: Option<HeadRequestsResult<N::PeerType>>,
-    ) -> Option<ConsensusEvent<N>> {
+    ) -> Option<ConsensusEvent> {
         // We can only lose established state right now if we drop below our minimum peer threshold.
         if self.is_established() {
             if self.num_agents() < self.min_peers {
@@ -304,7 +288,6 @@ impl<N: Network> Consensus<N> {
             // - accepted a minimum number of block announcements, or
             // - know the head state of a majority of our peers
             if self.num_agents() >= self.min_peers {
-                debug!("Trying to establish consensus, number of synced peers satisfied.");
                 if self.block_queue.accepted_block_announcements() >= Self::MIN_BLOCKS_ESTABLISHED {
                     info!("Consensus established, number of accepted announcements satisfied.");
                     self.established_flag.swap(true, Ordering::Release);
@@ -366,19 +349,28 @@ impl<N: Network> Future for Consensus<N> {
         // 1. Poll and advance block queue
         while let Poll::Ready(Some(event)) = self.block_queue.poll_next_unpin(cx) {
             match event {
-                BlockQueueEvent::PeerMacroSynced(peer) => {
-                    let e = ConsensusEvent::PeerMacroSynced(peer);
-                    self.events.send(e.clone()).ok(); // Ignore result.
+                BlockQueueEvent::AcceptedAnnouncedBlock(_) => {
+                    debug!("Now at block #{}", self.blockchain.read().block_number());
                 }
-                BlockQueueEvent::PeerLeft(_) => {
-                    self.events.send(ConsensusEvent::PeerLeft).ok(); // Ignore result.
-                }
-                BlockQueueEvent::ReceivedBlocks => {
-                    // When syncing a stopped chain, we want to immediately start a new head request
-                    // after receiving blocks for the current epoch.
+                BlockQueueEvent::AcceptedBufferedBlock(_, remaining_in_buffer) => {
                     if !self.is_established() {
+                        info!(
+                            "Catching up to tip of the chain (now at #{}, {} blocks remaining)",
+                            self.blockchain.read().block_number(),
+                            remaining_in_buffer
+                        );
+                    }
+                }
+                BlockQueueEvent::ReceivedMissingBlocks(_, _) => {
+                    if !self.is_established() {
+                        // When syncing a stopped chain, we want to immediately start a new head request
+                        // after receiving blocks for the current epoch.
                         self.head_requests_time = None;
                     }
+                }
+
+                BlockQueueEvent::RejectedBlock(hash) => {
+                    debug!("rejected block hash{}", hash);
                 }
             }
         }

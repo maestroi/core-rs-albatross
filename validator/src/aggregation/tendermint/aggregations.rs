@@ -1,16 +1,17 @@
-use futures::{
-    future,
-    stream::{BoxStream, SelectAll},
-    Sink, Stream, StreamExt,
-};
 use std::{
-    collections::BTreeMap,
+    collections::{btree_map::Entry, BTreeMap},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     task::Poll,
+};
+
+use futures::{
+    future,
+    stream::{BoxStream, SelectAll},
+    Sink, Stream, StreamExt,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -84,9 +85,9 @@ impl<N: ValidatorNetwork> TendermintAggregations<N> {
         >,
     ) {
         // TODO: TendermintAggregationEvent
-        if !self
+        if let Entry::Vacant(entry) = self
             .aggregation_descriptors
-            .contains_key(&(id.round_number, id.step))
+            .entry((id.round_number, id.step))
         {
             trace!("starting aggregation for {:?}", &id);
             // crate the correct protocol instance
@@ -115,13 +116,10 @@ impl<N: ValidatorNetwork> TendermintAggregations<N> {
             let stream_closer = Arc::new(AtomicBool::new(true));
 
             // Create and store AggregationDescriptor
-            self.aggregation_descriptors.insert(
-                (id.round_number, id.step),
-                AggregationDescriptor {
-                    input: sender,
-                    is_running: stream_closer.clone(),
-                },
-            );
+            entry.insert(AggregationDescriptor {
+                input: sender,
+                is_running: stream_closer.clone(),
+            });
 
             trace!(
                 "Aggregation_descriptors: {:?}",
@@ -190,62 +188,62 @@ impl<N: ValidatorNetwork + 'static> Stream for TendermintAggregations<N> {
 
         // empty out the input stream dispatching messages to the appropriate aggregations
         while let Poll::Ready(message) = self.input.poll_next_unpin(cx) {
-            match message {
-                Some(message) => {
-                    if let Some(descriptor) = self
-                        .aggregation_descriptors
-                        .get(&(message.tag.round_number, message.tag.step))
-                    {
-                        trace!("New message for ongoing aggregation: {:?}", &message);
-                        if descriptor.input.send(message.update).is_err() {
-                            debug!("Failed to relay LevelUpdate to aggregation");
-                        }
-                    } else if let Some(((highest_round, _), _)) =
-                        self.aggregation_descriptors.last_key_value()
-                    {
-                        // messages of future rounds need to be tracked in terrms of contributors only (without verifying them).
-                        // Also note that PreVote and PreCommit are tracked in the same bitset as the protocol requires.
-                        if highest_round < &message.tag.round_number {
-                            trace!("New contribution for future round: {:?}", &message);
-                            let future_contributors = self
-                                .future_aggregations
-                                .entry(message.tag.round_number)
-                                .and_modify(|bitset| {
-                                    *bitset |= message.update.aggregate.contributors()
-                                })
-                                .or_insert(message.update.aggregate.contributors())
-                                .clone();
-                            // now check if that suffices for a f+1 contributor weight
-                            if let Some(weight) =
-                                self.validator_registry.signers_weight(&future_contributors)
-                            {
-                                if weight
-                                    > policy::SLOTS as usize - policy::TWO_THIRD_SLOTS as usize
-                                {
-                                    return Poll::Ready(Some(
-                                        TendermintAggregationEvent::NewRound(
-                                            message.tag.round_number,
-                                        ),
-                                    ));
-                                }
+            if let Some(message) = message {
+                if let Some(descriptor) = self
+                    .aggregation_descriptors
+                    .get(&(message.tag.round_number, message.tag.step))
+                {
+                    trace!("New message for ongoing aggregation: {:?}", &message);
+                    if descriptor.input.send(message.update).is_err() {
+                        debug!("Failed to relay LevelUpdate to aggregation");
+                    }
+                } else if let Some(((highest_round, _), _)) =
+                    self.aggregation_descriptors.last_key_value()
+                {
+                    // messages of future rounds need to be tracked in terrms of contributors only (without verifying them).
+                    // Also note that PreVote and PreCommit are tracked in the same bitset as the protocol requires.
+                    if highest_round < &message.tag.round_number {
+                        trace!("New contribution for future round: {:?}", &message);
+                        let future_contributors = self
+                            .future_aggregations
+                            .entry(message.tag.round_number)
+                            .and_modify(|bitset| *bitset |= message.update.aggregate.contributors())
+                            .or_insert_with(|| message.update.aggregate.contributors())
+                            .clone();
+                        // now check if that suffices for a f+1 contributor weight
+                        if let Some(weight) =
+                            self.validator_registry.signers_weight(&future_contributors)
+                        {
+                            if weight > policy::SLOTS as usize - policy::TWO_THIRD_SLOTS as usize {
+                                return Poll::Ready(Some(TendermintAggregationEvent::NewRound(
+                                    message.tag.round_number,
+                                )));
                             }
                         }
-                    } else {
-                        // No last_key_value means there is no aggregation whatsoever.
-                        // Discard the update as there is no receiver for it and log to debug.
-                        debug!(
-                            "Found no agggregations, but received a LevelUpdateMessage: {:?}",
-                            &self.aggregation_descriptors
-                        );
                     }
-                }
-                // Poll::Ready(None) means the stream has terminated, which is likelt the network having droped.
-                // Try and reconnect but also log an error
-                None => {
-                    // error!("Networks receive from all returned Poll::Ready(None)");
-                    // return Poll::Ready(None);
+                } else {
+                    // No last_key_value means there is no aggregation whatsoever.
+                    // Discard the update as there is no receiver for it and log to debug.
+                    debug!(
+                        "Found no agggregations, but received a LevelUpdateMessage: {:?}",
+                        &self.aggregation_descriptors
+                    );
                 }
             }
+            /*
+            The code inside the `else {}` was commented before, so the `else {}` case was not doing anything anymore,
+            which means it made sense to refactor this from a `match` to an `if let`. I'm leaving the code here in case
+            the person who originally commented the code inside the `else {}` may need it in the future.
+
+            ```
+            else {
+             Poll::Ready(None) means the stream has terminated, which is likelt the network having droped.
+             Try and reconnect but also log an error
+             error!("Networks receive from all returned Poll::Ready(None)");
+             return Poll::Ready(None);
+            }
+            ```
+            */
         }
         // after that return whatever combined_aggregation_streams returns
         match self.combined_aggregation_streams.poll_next_unpin(cx) {

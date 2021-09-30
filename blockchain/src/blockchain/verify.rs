@@ -37,7 +37,7 @@ impl Blockchain {
 
         // Check if the block's immediate predecessor is part of the chain.
         let prev_info = blockchain
-            .get_chain_info(&header.parent_hash(), false, txn_opt)
+            .get_chain_info(header.parent_hash(), false, txn_opt)
             .unwrap();
 
         // Check that the block is a valid successor of its predecessor.
@@ -127,7 +127,7 @@ impl Blockchain {
 
                 // Check if a view change occurred - if so, validate the proof
                 let prev_info = blockchain
-                    .get_chain_info(&header.parent_hash(), false, txn_opt)
+                    .get_chain_info(header.parent_hash(), false, txn_opt)
                     .unwrap();
 
                 let view_number = if policy::is_macro_block_at(header.block_number() - 1) {
@@ -219,7 +219,7 @@ impl Blockchain {
                 for proof in &body.fork_proofs {
                     // Ensure proofs are ordered and unique.
                     if let Some(previous) = previous_proof {
-                        match previous.cmp(&proof) {
+                        match previous.cmp(proof) {
                             Ordering::Equal => {
                                 return Err(PushError::InvalidBlock(
                                     BlockError::DuplicateForkProof,
@@ -313,7 +313,7 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Verifies a block against the blockchain state AFTER it gets updated with the block (ex: if
+    /// Verifies a block against the blockchain state AFTER it gets updated with the block (ex: checking if
     /// an account has enough funds).
     /// It receives a block as input but that block is only required to have a header (the body and
     /// justification are optional, we don't need them).
@@ -333,7 +333,7 @@ impl Blockchain {
         let accounts = &state.accounts;
 
         // Verify accounts hash.
-        let accounts_hash = accounts.hash(txn_opt);
+        let accounts_hash = accounts.get_root(txn_opt);
 
         trace!("Block state root: {}", block.state_root());
 
@@ -369,9 +369,6 @@ impl Blockchain {
 
             let real_disabled_slots = staking_contract.previous_disabled_slots();
 
-            let inherents = self.create_macro_block_inherents(&state, &macro_block.header);
-            let real_transactions = self.create_txs_from_inherents(&inherents);
-
             // Get the validators.
             let real_validators = if macro_block.is_election_block() {
                 Some(self.next_validators(&macro_block.header.seed))
@@ -398,8 +395,8 @@ impl Blockchain {
                     return Err(PushError::InvalidBlock(BlockError::InvalidValidators));
                 }
 
-                if real_transactions != body.transactions {
-                    warn!("Rejecting block - Validators don't match real validators");
+                if !body.transactions.is_empty() {
+                    warn!("Rejecting block - Macro block contains transactions");
                     return Err(PushError::InvalidBlock(BlockError::BodyHashMismatch));
                 }
             } else {
@@ -409,7 +406,7 @@ impl Blockchain {
                     validators: real_validators,
                     lost_reward_set: real_lost_rewards,
                     disabled_set: real_disabled_slots,
-                    transactions: real_transactions,
+                    transactions: vec![],
                 };
 
                 if real_body.hash::<Blake2bHash>() != macro_block.header.body_root {

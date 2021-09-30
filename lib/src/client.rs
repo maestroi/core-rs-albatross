@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use nimiq_block::Block;
 use nimiq_blockchain::{AbstractBlockchain, Blockchain};
 use nimiq_consensus::{Consensus as AbstractConsensus, ConsensusProxy as AbstractConsensusProxy};
@@ -12,7 +14,6 @@ use nimiq_network_libp2p::{
     Config as NetworkConfig, Network,
 };
 use nimiq_utils::time::OffsetTime;
-
 #[cfg(feature = "validator")]
 use nimiq_validator::validator::Validator as AbstractValidator;
 #[cfg(feature = "validator")]
@@ -28,6 +29,7 @@ use nimiq_network_libp2p::Multiaddr;
 /// Alias for the Consensus and Validator specialized over libp2p network
 pub type Consensus = AbstractConsensus<Network>;
 pub type ConsensusProxy = AbstractConsensusProxy<Network>;
+#[cfg(feature = "validator")]
 pub type Validator = AbstractValidator<Network, ValidatorNetworkImpl<Network>>;
 
 /// Holds references to the relevant structs. This is then Arc'd in `Client` and a nice API is
@@ -55,9 +57,7 @@ pub(crate) struct ClientInner {
 }
 
 impl ClientInner {
-    async fn from_config(
-        config: ClientConfig,
-    ) -> Result<(Self, Consensus, Option<Validator>), Error> {
+    async fn from_config(config: ClientConfig) -> Result<Client, Error> {
         // Get network info (i.e. which specific blokchain we're on)
         if !config.network_id.is_albatross() {
             return Err(Error::config_error(&format!(
@@ -123,7 +123,9 @@ impl ClientInner {
             config.consensus.sync_mode,
             config.database,
         )?;
-        let blockchain = Arc::new(Blockchain::new(environment.clone(), config.network_id).unwrap());
+        let blockchain = Arc::new(RwLock::new(
+            Blockchain::new(environment.clone(), config.network_id, time).unwrap(),
+        ));
         let mempool = Mempool::new(Arc::clone(&blockchain), config.mempool);
 
         // Open wallet
@@ -145,14 +147,9 @@ impl ClientInner {
         // Initialize validator
         #[cfg(feature = "validator")]
         let validator = {
+            let validator_network = Arc::new(ValidatorNetworkImpl::new(Arc::clone(&network)));
+            #[cfg(feature = "wallet")]
             if let Some(config) = &config.validator {
-                #[cfg(not(feature = "wallet"))]
-                let validator_wallet_key = {
-                    log::warn!("Client is compiled without wallet and thus can't load the wallet account for the validator.");
-                    None
-                };
-
-                #[cfg(feature = "wallet")]
                 let validator_wallet_key = {
                     if let Some(wallet_account) = &config.wallet_account {
                         let address = wallet_account.parse().map_err(|_| {
@@ -187,8 +184,6 @@ impl ClientInner {
                     }
                 };
 
-                let validator_network = Arc::new(ValidatorNetworkImpl::new(Arc::clone(&network)));
-
                 let validator = Validator::new(
                     &consensus,
                     validator_network,
@@ -200,23 +195,39 @@ impl ClientInner {
             } else {
                 None
             }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let validator_wallet_key = {
+                    log::warn!("Client is compiled without wallet and thus can't load the wallet account for the validator.");
+                    None
+                };
+                let validator = Validator::new(
+                    &consensus,
+                    validator_network,
+                    validator_key,
+                    validator_wallet_key,
+                );
+
+                Some(validator)
+            }
         };
 
         // Start network.
         network.listen_on(config.network.listen_addresses).await;
         network.start_connecting().await;
 
-        Ok((
-            ClientInner {
+        Ok(Client {
+            inner: Arc::new(ClientInner {
                 environment,
                 network,
                 consensus: consensus.proxy(),
                 #[cfg(feature = "wallet")]
                 wallet_store,
-            },
-            consensus,
+            }),
+            consensus: Some(consensus),
+            #[cfg(feature = "validator")]
             validator,
-        ))
+        })
     }
 }
 
@@ -241,17 +252,13 @@ impl ClientInner {
 pub struct Client {
     inner: Arc<ClientInner>,
     consensus: Option<Consensus>,
+    #[cfg(feature = "validator")]
     validator: Option<Validator>,
 }
 
 impl Client {
     pub async fn from_config(config: ClientConfig) -> Result<Self, Error> {
-        let (inner, consensus, validator) = ClientInner::from_config(config).await?;
-        Ok(Client {
-            inner: Arc::new(inner),
-            consensus: Some(consensus),
-            validator,
-        })
+        ClientInner::from_config(config).await
     }
 
     pub fn consensus(&mut self) -> Option<Consensus> {
@@ -269,13 +276,13 @@ impl Client {
     }
 
     /// Returns a reference to the blockchain
-    pub fn blockchain(&self) -> Arc<Blockchain> {
+    pub fn blockchain(&self) -> Arc<RwLock<Blockchain>> {
         Arc::clone(&self.inner.consensus.blockchain)
     }
 
     /// Returns the blockchain head
     pub fn blockchain_head(&self) -> Block {
-        Arc::clone(&self.inner.consensus.blockchain).head()
+        Arc::clone(&self.inner.consensus.blockchain).read().head()
     }
 
     /// Returns a reference to the *Mempool*

@@ -22,8 +22,9 @@ pub enum NetworkEvent<P> {
 pub trait Topic {
     type Item: Serialize + Deserialize + Send + Sync + std::fmt::Debug + 'static;
 
-    fn topic(&self) -> String;
-    fn validate(&self) -> bool;
+    const BUFFER_SIZE: usize;
+    const NAME: &'static str;
+    const VALIDATE: bool;
 }
 
 impl<P: Peer> std::fmt::Debug for NetworkEvent<P> {
@@ -94,15 +95,17 @@ pub trait Network: Send + Sync + 'static {
         ReceiveFromAll::new(self).boxed()
     }
 
-    // TODO: Use `BoxStream`
-    async fn subscribe<T>(
+    async fn subscribe<'a, T>(
         &self,
-        topic: &T,
-    ) -> Result<Pin<Box<dyn Stream<Item = (T::Item, Self::PubsubId)> + Send>>, Self::Error>
+    ) -> Result<BoxStream<'a, (T::Item, Self::PubsubId)>, Self::Error>
     where
         T: Topic + Sync;
 
-    async fn publish<T: Topic>(&self, topic: &T, item: T::Item) -> Result<(), Self::Error>
+    async fn unsubscribe<'a, T>(&self) -> Result<(), Self::Error>
+    where
+        T: Topic + Sync;
+
+    async fn publish<T>(&self, item: T::Item) -> Result<(), Self::Error>
     where
         T: Topic + Sync;
 

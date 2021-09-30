@@ -1,3 +1,7 @@
+use std::collections::VecDeque;
+use std::marker::PhantomData;
+use std::ops::RangeBounds;
+
 use crate::error::Error;
 use crate::hash::{Hash, Merge};
 use crate::mmr::peaks::{PeakIterator, RevPeakIterator};
@@ -6,9 +10,6 @@ use crate::mmr::proof::{Proof, RangeProof};
 use crate::mmr::utils::bagging;
 use crate::store::memory::MemoryTransaction;
 use crate::store::Store;
-use std::collections::VecDeque;
-use std::marker::PhantomData;
-use std::ops::RangeBounds;
 
 pub mod partial;
 pub mod peaks;
@@ -16,6 +17,8 @@ pub mod position;
 pub mod proof;
 mod utils;
 
+/// This is the main struct for the Merkle Mountain Range. It simply consists of a store for the
+/// nodes and the number of leaves.
 pub struct MerkleMountainRange<H, S: Store<H>> {
     store: S,
     num_leaves: usize,
@@ -64,6 +67,7 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
         self.num_leaves
     }
 
+    /// Returns true if the tree is empty.
     pub fn is_empty(&self) -> bool {
         self.store.len() == 0
     }
@@ -107,6 +111,7 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
         Ok(leaf_index)
     }
 
+    /// Removes the most recent leaf.
     pub fn remove_back(&mut self) -> Result<(), Error> {
         if self.is_empty() {
             return Err(Error::EmptyTree);
@@ -138,31 +143,71 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
         bagging(it)
     }
 
-    pub fn prove(&self, positions: &[usize]) -> Result<Proof<H>, Error> {
+    /// Returns a Merkle proof for the given positions (representing the leaf indexes).
+    /// If the verifier has a MMR that is a subtree of the prover's MMR (meaning that the prover's
+    /// MMR is simply the verifier's MMR with more leaves added), you can set `verifier_state` to
+    /// the length of the verifier's MMR. This will construct a proof that is valid to the verifier.
+    pub fn prove(
+        &self,
+        positions: &[usize],
+        verifier_state: Option<usize>,
+    ) -> Result<Proof<H>, Error> {
+        // Determine length.
+        let length = match verifier_state {
+            None => self.len(),
+            Some(x) => {
+                if x > self.len() {
+                    return Err(Error::ProveInvalidLeaves);
+                } else {
+                    x
+                }
+            }
+        };
+
         // Sort positions and check that we only prove leaves.
         let positions: Result<Vec<Position>, Error> = positions
             .iter()
             .map(|&index| {
                 let pos = Position::from(leaf_number_to_index(index));
                 // Make sure that we only ever prove leaf nodes.
-                if pos.index >= self.len() {
+                if pos.index >= length {
                     return Err(Error::ProveInvalidLeaves);
                 }
                 Ok(pos)
             })
             .collect();
+
         let mut positions = positions?;
+
         positions.sort_unstable();
 
-        self.prove_positions(positions, self.len(), false)
+        self.prove_positions(positions, length, false)
     }
 
+    /// Returns a Merkle proof for a range of leaf indexes.
+    /// If the verifier has a MMR that is a subtree of the prover's MMR (meaning that the prover's
+    /// MMR is simply the verifier's MMR with more leaves added), you can set `verifier_state` to
+    /// the length of the verifier's MMR. This will construct a proof that is valid to the verifier.
+    /// If the verifier is receiving several consecutive range proofs, you can set `assume_previous`
+    /// to true. This will reduce the size of the proofs.
     pub fn prove_range<R: RangeBounds<usize> + Iterator<Item = usize>>(
         &self,
         range: R,
-        verifier_state: usize,
+        verifier_state: Option<usize>,
         assume_previous: bool,
     ) -> Result<RangeProof<H>, Error> {
+        // Determine length.
+        let length = match verifier_state {
+            None => self.len(),
+            Some(x) => {
+                if x > self.len() {
+                    return Err(Error::ProveInvalidLeaves);
+                } else {
+                    x
+                }
+            }
+        };
+
         // Find all leaves in the range.
         // If we know whether the first leaf is on the left-hand side or right-hand side,
         // we can simply alternate this for the following positions.
@@ -171,8 +216,10 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
             .map(leaf_number_to_index) // Map to tree internal indices.
             .filter(|i| *i < self.len())
             .peekable();
+
         // Find out which side our first leaf is on.
         let first_position = Position::from(*it.peek().ok_or(Error::ProveInvalidLeaves)?);
+
         // Then use this and produce positions without extra calls to `index_to_height`.
         let leaves: Vec<_> = it
             .scan(!first_position.right_node, |st, index| {
@@ -187,25 +234,30 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
 
         // If we assume the previous proof to be known, we can remove all proof nodes with an index <= our first leaf.
         Ok(RangeProof {
-            proof: self.prove_positions(leaves, verifier_state, assume_previous)?,
+            proof: self.prove_positions(leaves, length, assume_previous)?,
             assume_previous,
         })
     }
 
-    /// Assumes `positions` to be sorted already.
+    /// Private function that returns a Merkle proof for the given positions. Assumes `positions`
+    /// to be sorted already.
     fn prove_positions(
         &self,
         positions: Vec<Position>,
-        // Number of nodes in the verifier's MMR. Length of verifier's MMR.
-        verifier_state: usize,
+        tree_length: usize,
         assume_previous: bool,
     ) -> Result<Proof<H>, Error> {
-        // The slice of positions cannot be empty.
+        // The slice of positions cannot be empty. Except if the tree is also empty.
         if positions.is_empty() {
-            return Err(Error::ProveInvalidLeaves);
+            return if tree_length == 0 {
+                // In this case we return an empty proof.
+                Ok(Proof::new(0))
+            } else {
+                Err(Error::ProveInvalidLeaves)
+            };
         }
 
-        let mut proof = Proof::new(verifier_state);
+        let mut proof = Proof::new(tree_length);
         // Shortcut for trees of size 1.
         if proof.mmr_size == 1 && positions.len() == 1 && positions[0].index == 0 {
             return Ok(proof);
@@ -220,7 +272,7 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
         // Add proof nodes for each peak individually.
         let mut prev_i = 0; // Index into the `positions` Vec.
         let mut baggable_peaks = vec![]; // Collect empty peak positions since the last non-empty one (for bagging).
-        for peak in PeakIterator::new(verifier_state) {
+        for peak in PeakIterator::new(tree_length) {
             // Find all positions belonging to this peak.
             let peak_positions = &positions[prev_i..];
             let i_offset = peak_positions
@@ -270,6 +322,7 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
         Ok(proof)
     }
 
+    /// Private function that creates a Merkle proof for a single peak.
     /// The `lower_bound` parameter is used to exclude proof nodes below a certain index.
     /// If no proof nodes should be excluded, the parameter is set to 0.
     fn prove_for_peak(
@@ -347,10 +400,12 @@ impl<H: Merge + Clone, S: Store<H>> MerkleMountainRange<H, S> {
         Ok(())
     }
 
+    /// Returns an iterator for the MMR peaks in normal order. From biggest/left to smallest/right.
     fn peaks(&self) -> PeakIterator {
         PeakIterator::new(self.len())
     }
 
+    /// Returns an iterator for the MMR peaks in reverse order. From smallest/right to biggest/left.
     fn rev_peaks(&self) -> RevPeakIterator {
         RevPeakIterator::new(self.len())
     }
@@ -376,9 +431,10 @@ impl<H: Merge + Clone + PartialEq, S: Store<H>> MerkleMountainRange<H, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::mmr::utils::test_utils::{hash_mmr, TestHash};
     use crate::store::memory::MemoryStore;
+
+    use super::*;
 
     #[test]
     fn it_correctly_constructs_trees() {

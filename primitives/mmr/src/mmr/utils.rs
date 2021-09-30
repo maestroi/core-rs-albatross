@@ -33,8 +33,9 @@ pub(crate) fn bagging<H: Merge, I: Iterator<Item = Result<(H, usize), Error>>>(
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use super::*;
     use crate::hash::{Hash, Merge};
+
+    use super::*;
 
     pub(crate) fn hash_perfect_tree<H: Merge, T: Hash<H>>(values: &[T]) -> Option<H> {
         let len = values.len();
@@ -140,8 +141,9 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::mmr::utils::test_utils::TestHash;
+
+    use super::*;
 
     #[test]
     fn it_correctly_compute_bit_length() {
@@ -180,6 +182,6 @@ mod tests {
             bagging(positions.clone().into_iter().rev()),
             Ok(TestHash(42))
         );
-        assert_eq!(bagging(positions.clone().into_iter()), Ok(TestHash(42)));
+        assert_eq!(bagging(positions.into_iter()), Ok(TestHash(42)));
     }
 }

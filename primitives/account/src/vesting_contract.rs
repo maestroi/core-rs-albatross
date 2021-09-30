@@ -1,11 +1,15 @@
 use beserial::{Deserialize, Serialize};
-use keys::Address;
-use primitives::coin::Coin;
-use transaction::account::vesting_contract::CreationTransactionData;
-use transaction::{SignatureProof, Transaction};
+use nimiq_database::WriteTransaction;
+use nimiq_keys::Address;
+use nimiq_primitives::account::AccountType;
+use nimiq_primitives::coin::Coin;
+use nimiq_transaction::account::vesting_contract::CreationTransactionData;
+use nimiq_transaction::{SignatureProof, Transaction};
+use nimiq_trie::key_nibbles::KeyNibbles;
 
-use crate::inherent::{AccountInherentInteraction, Inherent};
-use crate::{Account, AccountError, AccountTransactionInteraction, AccountType};
+use crate::inherent::Inherent;
+use crate::interaction_traits::{AccountInherentInteraction, AccountTransactionInteraction};
+use crate::{Account, AccountError, AccountsTrie};
 
 #[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
@@ -37,7 +41,7 @@ impl VestingContract {
         }
     }
 
-    pub fn with_balance(&self, balance: Coin) -> Self {
+    pub fn change_balance(&self, balance: Coin) -> Self {
         VestingContract {
             balance,
             owner: self.owner.clone(),
@@ -62,76 +66,90 @@ impl VestingContract {
 }
 
 impl AccountTransactionInteraction for VestingContract {
-    fn new_contract(
-        account_type: AccountType,
-        balance: Coin,
-        transaction: &Transaction,
-        block_height: u32,
-        time: u64,
-    ) -> Result<Self, AccountError> {
-        if account_type == AccountType::Vesting {
-            VestingContract::create(balance, transaction, block_height, time)
-        } else {
-            Err(AccountError::InvalidForRecipient)
-        }
-    }
-
     fn create(
-        balance: Coin,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
-    ) -> Result<Self, AccountError> {
+        _block_time: u64,
+    ) -> Result<(), AccountError> {
         let data = CreationTransactionData::parse(transaction)?;
-        Ok(VestingContract::new(
-            balance,
+
+        let contract_key = KeyNibbles::from(&transaction.contract_creation_address());
+
+        let previous_balance = match accounts_tree.get(db_txn, &contract_key) {
+            None => Coin::ZERO,
+            Some(account) => account.balance(),
+        };
+
+        let contract = VestingContract::new(
+            previous_balance + transaction.value,
             data.owner,
             data.start_time,
             data.time_step,
             data.step_amount,
             data.total_amount,
-        ))
-    }
+        );
 
-    fn check_incoming_transaction(
-        _transaction: &Transaction,
-        _block_height: u32,
-        _time: u64,
-    ) -> Result<(), AccountError> {
-        Err(AccountError::InvalidForRecipient)
+        accounts_tree.put(db_txn, &contract_key, Account::Vesting(contract));
+
+        Ok(())
     }
 
     fn commit_incoming_transaction(
-        &mut self,
+        _accounts_tree: &AccountsTrie,
+        _db_txn: &mut WriteTransaction,
         _transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
     ) -> Result<Option<Vec<u8>>, AccountError> {
         Err(AccountError::InvalidForRecipient)
     }
 
     fn revert_incoming_transaction(
-        &mut self,
+        _accounts_tree: &AccountsTrie,
+        _db_txn: &mut WriteTransaction,
         _transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
         _receipt: Option<&Vec<u8>>,
     ) -> Result<(), AccountError> {
         Err(AccountError::InvalidForRecipient)
     }
 
-    fn check_outgoing_transaction(
-        &self,
+    fn commit_outgoing_transaction(
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        time: u64,
-    ) -> Result<(), AccountError> {
+        block_time: u64,
+    ) -> Result<Option<Vec<u8>>, AccountError> {
+        let key = KeyNibbles::from(&transaction.sender);
+
+        let account = accounts_tree
+            .get(db_txn, &key)
+            .ok_or(AccountError::NonExistentAddress {
+                address: transaction.sender.clone(),
+            })?;
+
+        let vesting = match account {
+            Account::Vesting(ref value) => value,
+            _ => {
+                return Err(AccountError::TypeMismatch {
+                    expected: AccountType::Vesting,
+                    got: account.account_type(),
+                })
+            }
+        };
+
+        let new_balance = Account::balance_sub(account.balance(), transaction.total_value()?)?;
+
         // Check vesting min cap.
-        let balance: Coin = Account::balance_sub(self.balance, transaction.total_value()?)?;
-        let min_cap = self.min_cap(time);
-        if balance < min_cap {
+        let min_cap = vesting.min_cap(block_time);
+
+        if new_balance < min_cap {
             return Err(AccountError::InsufficientFunds {
-                balance,
+                balance: new_balance,
                 needed: min_cap,
             });
         }
@@ -139,64 +157,79 @@ impl AccountTransactionInteraction for VestingContract {
         // Check transaction signer is contract owner.
         let signature_proof: SignatureProof =
             Deserialize::deserialize(&mut &transaction.proof[..])?;
-        if !signature_proof.is_signed_by(&self.owner) {
+
+        if !signature_proof.is_signed_by(&vesting.owner) {
             return Err(AccountError::InvalidSignature);
         }
 
-        Ok(())
-    }
+        accounts_tree.put(
+            db_txn,
+            &key,
+            Account::Vesting(vesting.change_balance(new_balance)),
+        );
 
-    fn commit_outgoing_transaction(
-        &mut self,
-        transaction: &Transaction,
-        block_height: u32,
-        time: u64,
-    ) -> Result<Option<Vec<u8>>, AccountError> {
-        self.check_outgoing_transaction(transaction, block_height, time)?;
-        self.balance = Account::balance_sub(self.balance, transaction.total_value()?)?;
         Ok(None)
     }
 
     fn revert_outgoing_transaction(
-        &mut self,
+        accounts_tree: &AccountsTrie,
+        db_txn: &mut WriteTransaction,
         transaction: &Transaction,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
         receipt: Option<&Vec<u8>>,
     ) -> Result<(), AccountError> {
         if receipt.is_some() {
             return Err(AccountError::InvalidReceipt);
         }
 
-        self.balance = Account::balance_add(self.balance, transaction.total_value()?)?;
+        let key = KeyNibbles::from(&transaction.sender);
+
+        let account = accounts_tree
+            .get(db_txn, &key)
+            .ok_or(AccountError::NonExistentAddress {
+                address: transaction.sender.clone(),
+            })?;
+
+        let vesting = match account {
+            Account::Vesting(ref value) => value,
+            _ => {
+                return Err(AccountError::TypeMismatch {
+                    expected: AccountType::Vesting,
+                    got: account.account_type(),
+                })
+            }
+        };
+
+        let new_balance = Account::balance_add(account.balance(), transaction.total_value()?)?;
+
+        accounts_tree.put(
+            db_txn,
+            &key,
+            Account::Vesting(vesting.change_balance(new_balance)),
+        );
+
         Ok(())
     }
 }
 
 impl AccountInherentInteraction for VestingContract {
-    fn check_inherent(
-        &self,
-        _inherent: &Inherent,
-        _block_height: u32,
-        _time: u64,
-    ) -> Result<(), AccountError> {
-        Err(AccountError::InvalidInherent)
-    }
-
     fn commit_inherent(
-        &mut self,
+        _accounts_tree: &AccountsTrie,
+        _db_txn: &mut WriteTransaction,
         _inherent: &Inherent,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
     ) -> Result<Option<Vec<u8>>, AccountError> {
         Err(AccountError::InvalidInherent)
     }
 
     fn revert_inherent(
-        &mut self,
+        _accounts_tree: &AccountsTrie,
+        _db_txn: &mut WriteTransaction,
         _inherent: &Inherent,
         _block_height: u32,
-        _time: u64,
+        _block_time: u64,
         _receipt: Option<&Vec<u8>>,
     ) -> Result<(), AccountError> {
         Err(AccountError::InvalidInherent)

@@ -12,63 +12,26 @@ pub mod account_type {
     where
         S: Serializer,
     {
-        Serialize::serialize(&u8::from(*account_type), serializer)
+        let ty = match account_type {
+            AccountType::Basic => "basic",
+            AccountType::Vesting => "vesting",
+            AccountType::HTLC => "htlc",
+            _ => unreachable!(),
+        };
+        Serialize::serialize(ty, serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<AccountType, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let n: u8 = Deserialize::deserialize(deserializer)?;
-        AccountType::try_from(n).map_err(D::Error::custom)
-    }
-}
-
-pub mod address_hex {
-    use serde::{
-        de::{Deserialize, Deserializer, Error},
-        ser::{Serialize, Serializer},
-    };
-
-    use nimiq_keys::Address;
-
-    pub fn serialize<S>(address: &Address, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        Serialize::serialize(&address.to_hex(), serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Address, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: &'de str = Deserialize::deserialize(deserializer)?;
-        s.parse().map_err(D::Error::custom)
-    }
-}
-
-pub mod address_friendly {
-    use serde::{
-        de::{Deserialize, Deserializer, Error},
-        ser::{Serialize, Serializer},
-    };
-
-    use nimiq_keys::Address;
-
-    pub fn serialize<S>(address: &Address, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        Serialize::serialize(&address.to_user_friendly_address(), serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Address, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: &'de str = Deserialize::deserialize(deserializer)?;
-        Address::from_user_friendly_address(s).map_err(D::Error::custom)
+        let ty: AccountType = match Deserialize::deserialize(deserializer)? {
+            "basic" => AccountType::Basic,
+            "vesting" => AccountType::Vesting,
+            "htlc" => AccountType::HTLC,
+            _ => unreachable!(),
+        };
+        AccountType::try_from(ty).map_err(D::Error::custom)
     }
 }
 

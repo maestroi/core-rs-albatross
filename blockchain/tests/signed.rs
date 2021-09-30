@@ -11,10 +11,11 @@ use nimiq_collections::bitset::BitSet;
 use nimiq_database::volatile::VolatileEnvironment;
 use nimiq_genesis::NetworkId;
 use nimiq_hash::{Blake2bHash, Hash};
+use nimiq_keys::Address;
 use nimiq_nano_primitives::pk_tree_construct;
-use nimiq_primitives::account::ValidatorId;
 use nimiq_primitives::policy;
 use nimiq_primitives::slots::{Validator, Validators};
+use nimiq_utils::time::OffsetTime;
 use nimiq_vrf::VrfSeed;
 
 // /// Still in for future reference, in case this key is needed again
@@ -56,7 +57,7 @@ fn test_view_change_single_signature() {
 
     // verify view change proof
     let validators = Validators::new(vec![Validator::new(
-        ValidatorId::default(),
+        Address::default(),
         LazyPublicKey::from(key_pair.public_key),
         (0, policy::SLOTS),
     )]);
@@ -68,9 +69,10 @@ fn test_view_change_single_signature() {
 /// Tests if an attacker can use the prepare signature to fake a commit signature. If we would
 /// only sign the `block_hash`, this would work, but `SignedMessage` adds a prefix byte.
 fn test_replay() {
+    let time = Arc::new(OffsetTime::new());
     // Create a blockchain to have access to the validator slots.
     let env = VolatileEnvironment::new(10).unwrap();
-    let blockchain = Arc::new(Blockchain::new(env, NetworkId::UnitAlbatross).unwrap());
+    let blockchain = Arc::new(Blockchain::new(env, NetworkId::UnitAlbatross, time).unwrap());
 
     // load key pair
     let key_pair = KeyPair::deserialize_from_vec(&hex::decode(SECRET_KEY).unwrap()).unwrap();

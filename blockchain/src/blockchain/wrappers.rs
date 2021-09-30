@@ -1,9 +1,6 @@
-use parking_lot::{MutexGuard, RwLockReadGuard};
-
 use nimiq_account::{Account, StakingContract};
 use nimiq_block::Block;
-use nimiq_database::WriteTransaction;
-use nimiq_genesis::NetworkInfo;
+use nimiq_database::{ReadTransaction, WriteTransaction};
 use nimiq_hash::Blake2bHash;
 use nimiq_keys::Address;
 use nimiq_primitives::policy;
@@ -13,12 +10,13 @@ use crate::blockchain_state::BlockchainState;
 #[cfg(feature = "metrics")]
 use crate::chain_metrics::BlockchainMetrics;
 use crate::{AbstractBlockchain, Blockchain, BlockchainEvent, Direction};
+use nimiq_trie::key_nibbles::KeyNibbles;
 
 /// Implements several wrapper functions.
 impl Blockchain {
-    /// Returns the current state (with a read transaction).
-    pub fn state(&self) -> RwLockReadGuard<BlockchainState> {
-        self.state.read()
+    /// Returns the current state
+    pub fn state(&self) -> &BlockchainState {
+        &self.state
     }
 
     /// Fetches a given number of blocks, starting at a specific block (by its hash).
@@ -56,17 +54,18 @@ impl Blockchain {
 
     /// Returns the current staking contract.
     pub fn get_staking_contract(&self) -> StakingContract {
-        let validator_registry = self
-            .staking_contract_address()
-            .expect("NetworkInfo doesn't have a staking contract address set!");
+        let staking_contract_address = StakingContract::get_key_staking_contract();
 
-        let account = self.state.read().accounts.get(validator_registry, None);
-
-        if let Account::Staking(x) = account {
-            x
-        } else {
-            unreachable!("Account type must be Staking.")
+        match self.state.accounts.get(&staking_contract_address, None) {
+            Some(Account::Staking(x)) => x,
+            _ => {
+                unreachable!()
+            }
         }
+    }
+
+    pub fn read_transaction(&self) -> ReadTransaction {
+        ReadTransaction::new(&self.env)
     }
 
     pub fn write_transaction(&self) -> WriteTransaction {
@@ -74,14 +73,21 @@ impl Blockchain {
     }
 
     pub fn register_listener<T: Listener<BlockchainEvent> + 'static>(
-        &self,
+        &mut self,
         listener: T,
     ) -> ListenerHandle {
-        self.notifier.write().register(listener)
+        self.notifier.register(listener)
     }
 
-    pub fn get_account(&self, address: &Address) -> Account {
-        self.state.read().accounts.get(address, None)
+    pub fn get_account(&self, address: &Address) -> Option<Account> {
+        // TODO: Find a better place for this differentiation, it should be in a more general location
+        let key = if address.to_user_friendly_address() == policy::STAKING_CONTRACT_ADDRESS {
+            StakingContract::get_key_staking_contract()
+        } else {
+            KeyNibbles::from(address)
+        };
+
+        self.state.accounts.get(&key, None)
     }
 
     /// Checks if we have seen some transaction with this hash inside the validity window. This is
@@ -112,12 +118,9 @@ impl Blockchain {
         false
     }
 
-    pub fn staking_contract_address(&self) -> Option<&Address> {
-        NetworkInfo::from_network_id(self.network_id).staking_contract_address()
-    }
-
-    pub fn lock(&self) -> MutexGuard<()> {
-        self.push_lock.lock()
+    pub fn staking_contract_address(&self) -> Address {
+        Address::from_any_str(policy::STAKING_CONTRACT_ADDRESS)
+            .expect("Couldn't parse the Staking contract address from the policy file!")
     }
 
     #[cfg(feature = "metrics")]

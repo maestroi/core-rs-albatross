@@ -35,7 +35,10 @@ pub enum NetworkError {
     GossipsubSubscription(libp2p::gossipsub::error::SubscriptionError),
 
     #[error("Already subscribed to topic: {topic_name}")]
-    AlreadySubscribed { topic_name: String },
+    AlreadySubscribed { topic_name: &'static str },
+
+    #[error("Already unsubscribed to topic: {topic_name}")]
+    AlreadyUnsubscribed { topic_name: &'static str },
 }
 
 impl From<libp2p::kad::store::Error> for NetworkError {

@@ -1,7 +1,6 @@
+#[cfg(any(feature = "account", feature = "networks", feature = "slots"))]
 #[macro_use]
 extern crate beserial_derive;
-#[cfg(feature = "nimiq-macros")]
-extern crate nimiq_macros;
 
 #[cfg(feature = "account")]
 pub mod account;
@@ -11,5 +10,5 @@ pub mod coin;
 pub mod networks;
 #[cfg(feature = "policy")]
 pub mod policy;
-#[cfg(feature = "validators")]
+#[cfg(feature = "slots")]
 pub mod slots;

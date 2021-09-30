@@ -7,8 +7,8 @@ use account::Account;
 use account::AccountsList;
 use beserial::Deserialize;
 use hash::Blake2bHash;
-use keys::Address;
 use keys::PublicKey;
+use nimiq_trie::key_nibbles::KeyNibbles;
 use peer_address::address::seed_list::SeedList;
 use peer_address::address::{NetAddress, PeerAddress, PeerAddressType, PeerId};
 use peer_address::services::ServiceFlags;
@@ -19,7 +19,6 @@ struct GenesisData {
     block: &'static [u8],
     hash: Blake2bHash,
     accounts: &'static [u8],
-    staking_contract: Option<Address>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,16 +66,11 @@ impl NetworkInfo {
     }
 
     #[inline]
-    pub fn genesis_accounts(&self) -> Vec<(Address, Account)> {
+    pub fn genesis_accounts(&self) -> Vec<(KeyNibbles, Account)> {
         let accounts: AccountsList =
             Deserialize::deserialize_from_vec(&self.genesis.accounts.to_vec())
                 .expect("Failed to deserialize genesis accounts.");
         accounts.0
-    }
-
-    #[inline]
-    pub fn staking_contract_address(&self) -> Option<&Address> {
-        self.genesis.staking_contract.as_ref()
     }
 
     pub fn from_network_id(network_id: NetworkId) -> &'static Self {

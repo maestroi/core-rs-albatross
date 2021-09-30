@@ -1,25 +1,25 @@
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
 use crate::messages::*;
 use block::Block;
 use blockchain::{AbstractBlockchain, Blockchain, Direction, CHUNK_SIZE};
 use network_interface::message::ResponseMessage;
-use nimiq_genesis::NetworkInfo;
 use primitives::policy;
-use std::sync::Arc;
 
 /// This trait defines the behaviour when receiving a message and how to generate the response.
 pub trait Handle<Response> {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<Response>;
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> Response;
 }
 
 impl Handle<BlockHashes> for RequestBlockHashes {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<BlockHashes> {
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> BlockHashes {
+        let blockchain = blockchain.read();
         // A peer has requested blocks. Check all requested block locator hashes
         // in the given order and pick the first hash that is found on our main
-        // chain, ignore the rest. If none of the requested hashes is found,
-        // pick the genesis block hash. Send the main chain starting from the
-        // picked hash back to the peer.
-        let network_info = NetworkInfo::from_network_id(blockchain.network_id);
-        let mut start_block_hash = network_info.genesis_hash().clone();
+        // chain, ignore the rest.
+        let mut start_block_hash_opt = None;
         for locator in self.locators.iter() {
             if blockchain
                 .chain_store
@@ -27,11 +27,18 @@ impl Handle<BlockHashes> for RequestBlockHashes {
                 .is_some()
             {
                 // We found a block, ignore remaining block locator hashes.
-                start_block_hash = locator.clone();
-                trace!("Start block found: {:?}", &start_block_hash);
+                trace!("Start block found: {:?}", &locator);
+                start_block_hash_opt = Some(locator.clone());
                 break;
             }
         }
+        if start_block_hash_opt.is_none() {
+            return BlockHashes {
+                hashes: None,
+                request_identifier: self.get_request_identifier(),
+            };
+        }
+        let start_block_hash = start_block_hash_opt.unwrap();
 
         // Collect up to GETBLOCKS_VECTORS_MAX inventory vectors for the blocks starting right
         // after the identified block on the main chain.
@@ -71,72 +78,81 @@ impl Handle<BlockHashes> for RequestBlockHashes {
             }
         }
 
-        Some(BlockHashes {
-            hashes,
+        BlockHashes {
+            hashes: Some(hashes),
             request_identifier: self.get_request_identifier(),
-        })
+        }
     }
 }
 
 impl Handle<BatchSetInfo> for RequestBatchSet {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<BatchSetInfo> {
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> BatchSetInfo {
+        let blockchain = blockchain.read();
         if let Some(Block::Macro(block)) = blockchain.get_block(&self.hash, true, None) {
             // Leaf indices are 0 based thus the + 1
             let history_len = blockchain
                 .history_store
-                // TODO Refactor get_last_leaf_index_of_block
                 .get_last_leaf_index_of_block(block.header.block_number, None)
+                .expect("Can't find block number in the History Store!")
                 + 1;
-
-            let response = BatchSetInfo {
-                block,
+            BatchSetInfo {
+                block: Some(block),
                 history_len,
                 request_identifier: self.get_request_identifier(),
-            };
-
-            Some(response)
+            }
         } else {
-            None
+            BatchSetInfo {
+                block: None,
+                history_len: 0,
+                request_identifier: self.get_request_identifier(),
+            }
         }
     }
 }
 
 impl Handle<HistoryChunk> for RequestHistoryChunk {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<HistoryChunk> {
-        let chunk = blockchain.history_store.prove_chunk(
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> HistoryChunk {
+        let chunk = blockchain.read().history_store.prove_chunk(
             self.epoch_number,
             self.block_number,
             CHUNK_SIZE,
             self.chunk_index as usize,
             None,
         );
-        let response = HistoryChunk {
+        HistoryChunk {
             chunk,
             request_identifier: self.get_request_identifier(),
-        };
-        Some(response)
+        }
     }
 }
 
 impl Handle<ResponseBlock> for RequestBlock {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<ResponseBlock> {
-        let block = blockchain.get_block(&self.hash, true, None);
-        let response = ResponseBlock {
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> ResponseBlock {
+        let block = blockchain.read().get_block(&self.hash, true, None);
+        ResponseBlock {
             block,
             request_identifier: self.get_request_identifier(),
-        };
-        Some(response)
+        }
     }
 }
 
 impl Handle<ResponseBlocks> for RequestMissingBlocks {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<ResponseBlocks> {
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> ResponseBlocks {
+        let blockchain = blockchain.read();
         // Behaviour of our missing blocks request:
         // 1. Receives `target_block_hash: Blake2bHash, locators: Vec<Blake2bHash>`
         // 2. Return all blocks in between most recent locator on our main chain and target block hash
         // 3. This should also work across 1 or 2 batches with an upper bound
         // For now, we just ignore the case if we receive a block announcement which is more than 1-2 batches away from our current block.
-        let target_block = blockchain.get_block(&self.target_hash, false, None)?;
+        let target_block_opt = blockchain.get_block(&self.target_hash, false, None);
+        if target_block_opt.is_none() {
+            return ResponseBlocks {
+                blocks: None,
+                request_identifier: self.get_request_identifier(),
+            };
+        }
+
+        let target_block = target_block_opt.unwrap();
 
         // A peer has requested blocks. Check all requested block locator hashes
         // in the given order and pick the first hash that is found on our main
@@ -154,11 +170,18 @@ impl Handle<ResponseBlocks> for RequestMissingBlocks {
 
         // if no start_block can be found, assume the last macro block before target_block
         let start_block = if start_block.is_none() {
-            blockchain.get_block_at(
+            if let Some(block) = blockchain.get_block_at(
                 policy::macro_block_before(target_block.block_number()),
                 false,
                 None,
-            )?
+            ) {
+                block
+            } else {
+                return ResponseBlocks {
+                    blocks: None,
+                    request_identifier: self.get_request_identifier(),
+                };
+            }
         } else {
             start_block.unwrap()
         };
@@ -167,7 +190,10 @@ impl Handle<ResponseBlocks> for RequestMissingBlocks {
         let num_blocks = target_block.block_number() - start_block.block_number();
         if num_blocks > policy::BATCH_LENGTH * 2 {
             debug!("Received missing block request across more than 2 batches.");
-            return None;
+            return ResponseBlocks {
+                blocks: None,
+                request_identifier: self.get_request_identifier(),
+            };
         }
 
         // Collect the blocks starting right after the identified block on the main chain
@@ -175,20 +201,19 @@ impl Handle<ResponseBlocks> for RequestMissingBlocks {
         let blocks =
             blockchain.get_blocks(&start_block.hash(), num_blocks, true, Direction::Forward);
 
-        Some(ResponseBlocks {
-            blocks,
+        ResponseBlocks {
+            blocks: Some(blocks),
             request_identifier: self.get_request_identifier(),
-        })
+        }
     }
 }
 
 impl Handle<HeadResponse> for RequestHead {
-    fn handle(&self, blockchain: &Arc<Blockchain>) -> Option<HeadResponse> {
-        let hash = blockchain.head_hash();
-        let response = HeadResponse {
+    fn handle(&self, blockchain: &Arc<RwLock<Blockchain>>) -> HeadResponse {
+        let hash = blockchain.read().head_hash();
+        HeadResponse {
             hash,
             request_identifier: self.get_request_identifier(),
-        };
-        Some(response)
+        }
     }
 }

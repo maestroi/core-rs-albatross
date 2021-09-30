@@ -3,8 +3,6 @@ use std::convert::{TryFrom, TryInto};
 use strum_macros::Display;
 use thiserror::Error;
 
-use nimiq_macros::{add_hex_io_fns_typed_arr, create_typed_array};
-
 use beserial::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Serialize, Deserialize, Display)]
@@ -19,7 +17,9 @@ pub enum AccountType {
     Vesting = 1,
     HTLC = 2,
     Staking = 3,
-    Reward = 4,
+    StakingValidator = 4,
+    StakingValidatorsStaker = 5,
+    StakingStaker = 6,
 }
 
 impl AccountType {
@@ -43,6 +43,9 @@ impl TryFrom<u8> for AccountType {
             1 => Ok(AccountType::Vesting),
             2 => Ok(AccountType::HTLC),
             3 => Ok(AccountType::Staking),
+            4 => Ok(AccountType::StakingValidator),
+            5 => Ok(AccountType::StakingValidatorsStaker),
+            6 => Ok(AccountType::StakingStaker),
             _ => Err(Error(value)),
         }
     }
@@ -55,41 +58,9 @@ impl From<AccountType> for u8 {
             AccountType::Vesting => 1,
             AccountType::HTLC => 2,
             AccountType::Staking => 3,
-            AccountType::Reward => 4,
-        }
-    }
-}
-
-create_typed_array!(ValidatorId, u8, 20);
-add_hex_io_fns_typed_arr!(ValidatorId, ValidatorId::SIZE);
-
-#[cfg(feature = "serde-derive")]
-mod serde_derive {
-    use std::borrow::Cow;
-
-    use serde::{
-        de::{Deserialize, Deserializer, Error},
-        ser::{Serialize, Serializer},
-    };
-
-    use super::ValidatorId;
-
-    impl Serialize for ValidatorId {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            serializer.serialize_str(&self.to_hex())
-        }
-    }
-
-    impl<'de> Deserialize<'de> for ValidatorId {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let data: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-            data.parse().map_err(Error::custom)
+            AccountType::StakingValidator => 4,
+            AccountType::StakingValidatorsStaker => 5,
+            AccountType::StakingStaker => 6,
         }
     }
 }

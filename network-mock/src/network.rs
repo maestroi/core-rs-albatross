@@ -1,15 +1,13 @@
-use std::{
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use async_trait::async_trait;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::{BoxStream, StreamExt};
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::sync::broadcast::Sender;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use beserial::{Deserialize, Serialize};
@@ -19,7 +17,7 @@ use nimiq_network_interface::{network::Network, peer_map::ObservablePeerMap};
 
 use crate::{hub::MockHubInner, peer::MockPeer, MockAddress, MockPeerId};
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error, PartialEq)]
 pub enum MockNetworkError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] beserial::SerializingError),
@@ -29,6 +27,12 @@ pub enum MockNetworkError {
 
     #[error("Network is not connected")]
     NotConnected,
+
+    #[error("Peer is already subscribed to topic: {0}")]
+    AlreadySubscribed(&'static str),
+
+    #[error("Peer is already unsubscribed to topic: {0}")]
+    AlreadyUnsubscribed(&'static str),
 }
 
 #[derive(Clone, Debug)]
@@ -180,40 +184,55 @@ impl Network for MockNetwork {
         self.get_peer_updates().1
     }
 
-    async fn subscribe<T>(
+    async fn subscribe<'a, T>(
         &self,
-        topic: &T,
-    ) -> Result<Pin<Box<dyn Stream<Item = (T::Item, Self::PubsubId)> + Send>>, Self::Error>
+    ) -> Result<BoxStream<'a, (T::Item, Self::PubsubId)>, Self::Error>
     where
         T: Topic + Sync,
     {
         let mut hub = self.hub.lock();
         let is_connected = Arc::clone(&self.is_connected);
 
-        let stream =
-            BroadcastStream::new(hub.get_topic(topic.topic()).subscribe()).filter_map(move |r| {
-                let is_connected = Arc::clone(&is_connected);
+        let topic_name = T::NAME;
 
-                async move {
-                    if is_connected.load(Ordering::SeqCst) {
-                        match r {
-                            Ok((data, peer_id)) => match T::Item::deserialize_from_vec(&data) {
-                                Ok(item) => return Some((item, peer_id)),
-                                Err(e) => {
-                                    log::warn!("Dropped item because deserialization failed: {}", e)
-                                }
-                            },
-                            Err(BroadcastStreamRecvError::Lagged(_)) => {
-                                log::warn!("Mock gossipsub channel is lagging")
+        log::debug!(
+            "Peer {} subscribing to topic '{}'",
+            self.address,
+            topic_name
+        );
+
+        // Add this peer to the topic list
+        let sender: &Sender<(Arc<Vec<u8>>, MockPeerId)>;
+
+        if let Some(topic) = hub.subscribe(topic_name, self.address) {
+            sender = &topic.sender;
+        } else {
+            return Err(MockNetworkError::AlreadySubscribed(topic_name));
+        }
+
+        let stream = BroadcastStream::new(sender.subscribe()).filter_map(move |r| {
+            let is_connected = Arc::clone(&is_connected);
+
+            async move {
+                if is_connected.load(Ordering::SeqCst) {
+                    match r {
+                        Ok((data, peer_id)) => match T::Item::deserialize_from_vec(&data) {
+                            Ok(item) => return Some((item, peer_id)),
+                            Err(e) => {
+                                log::warn!("Dropped item because deserialization failed: {}", e)
                             }
+                        },
+                        Err(BroadcastStreamRecvError::Lagged(_)) => {
+                            log::warn!("Mock gossipsub channel is lagging")
                         }
-                    } else {
-                        log::debug!("Network not connected: Dropping gossipsub message.");
                     }
-
-                    None
+                } else {
+                    log::debug!("Network not connected: Dropping gossipsub message.");
                 }
-            });
+
+                None
+            }
+        });
 
         Ok(stream
             .map(|(topic, peer_id)| {
@@ -223,31 +242,60 @@ impl Network for MockNetwork {
                 (topic, id)
             })
             .boxed())
-
-        //   Ok(stream.boxed())
     }
 
-    async fn publish<T: Topic>(&self, topic: &T, item: T::Item) -> Result<(), Self::Error>
+    async fn unsubscribe<'a, T>(&self) -> Result<(), Self::Error>
     where
         T: Topic + Sync,
     {
         let mut hub = self.hub.lock();
 
-        let topic = topic.topic();
+        let topic_name = T::NAME;
+
+        log::debug!(
+            "Peer {} unsubscribing from topic '{}'",
+            self.address,
+            topic_name
+        );
+
+        if self.is_connected.load(Ordering::SeqCst) {
+            if hub.unsubscribe(topic_name, &self.address) {
+                Ok(())
+            } else {
+                Err(MockNetworkError::AlreadyUnsubscribed(topic_name))
+            }
+        } else {
+            Err(MockNetworkError::NotConnected)
+        }
+    }
+
+    async fn publish<T: Topic>(&self, item: T::Item) -> Result<(), Self::Error>
+    where
+        T: Topic + Sync,
+    {
+        let mut hub = self.hub.lock();
+
+        let topic_name = T::NAME;
         let data = item.serialize_to_vec();
 
         log::debug!(
             "Peer {} publishing on topic '{}': {:?}",
             self.address,
-            topic,
+            topic_name,
             item
         );
 
         if self.is_connected.load(Ordering::SeqCst) {
-            hub.get_topic(topic)
-                .send((Arc::new(data), self.address.into()))
-                .unwrap();
-            Ok(())
+            if let Some(topic) = hub.get_topic(topic_name) {
+                topic
+                    .sender
+                    .send((Arc::new(data), self.address.into()))
+                    .unwrap();
+                Ok(())
+            } else {
+                log::debug!("No peer is subscribed to topic: '{}'", topic_name);
+                Ok(())
+            }
         } else {
             Err(MockNetworkError::NotConnected)
         }
@@ -271,7 +319,7 @@ impl Network for MockNetwork {
             let hub = self.hub.lock();
 
             if let Some(data) = hub.dht.get(k.as_ref()) {
-                Ok(Some(V::deserialize_from_vec(&data)?))
+                Ok(Some(V::deserialize_from_vec(data)?))
             } else {
                 Ok(None)
             }

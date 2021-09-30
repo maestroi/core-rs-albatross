@@ -1,12 +1,13 @@
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use beserial::Deserialize;
-use futures::{Stream, StreamExt};
-use simple_logger::SimpleLogger;
-
 use futures::task::{Context, Poll};
-use nimiq_block_production::{test_utils::*, BlockProducer};
+use futures::{Stream, StreamExt};
+use parking_lot::RwLock;
+
+use beserial::Deserialize;
+use nimiq_block_production::BlockProducer;
 use nimiq_blockchain::{AbstractBlockchain, Blockchain};
 use nimiq_bls::{KeyPair, SecretKey};
 use nimiq_consensus::consensus::Consensus;
@@ -18,9 +19,10 @@ use nimiq_database::volatile::VolatileEnvironment;
 use nimiq_genesis::NetworkId;
 use nimiq_mempool::{Mempool, MempoolConfig};
 use nimiq_network_interface::network::Network;
-use nimiq_network_mock::{MockHub, MockNetwork, MockPeer};
+use nimiq_network_mock::{MockHub, MockNetwork};
 use nimiq_primitives::policy;
-use std::pin::Pin;
+use nimiq_test_utils::blockchain::produce_macro_blocks;
+use nimiq_utils::time::OffsetTime;
 
 pub struct MockHistorySyncStream<TNetwork: Network> {
     network: Arc<TNetwork>,
@@ -44,13 +46,16 @@ const SECRET_KEY: &str =
 
 #[tokio::test]
 async fn peers_can_sync() {
-    // SimpleLogger::new().init().unwrap();
+    //simple_logger::SimpleLogger::new().init().unwrap();
 
     let mut hub = MockHub::default();
 
     // Setup first peer.
     let env1 = VolatileEnvironment::new(10).unwrap();
-    let blockchain1 = Arc::new(Blockchain::new(env1.clone(), NetworkId::UnitAlbatross).unwrap());
+    let time = Arc::new(OffsetTime::new());
+    let blockchain1 = Arc::new(RwLock::new(
+        Blockchain::new(env1.clone(), NetworkId::UnitAlbatross, time).unwrap(),
+    ));
     let mempool1 = Mempool::new(Arc::clone(&blockchain1), MempoolConfig::default());
 
     let keypair =
@@ -80,8 +85,11 @@ async fn peers_can_sync() {
     .await;
 
     // Setup second peer (not synced yet).
+    let time = Arc::new(OffsetTime::new());
     let env2 = VolatileEnvironment::new(10).unwrap();
-    let blockchain2 = Arc::new(Blockchain::new(env2.clone(), NetworkId::UnitAlbatross).unwrap());
+    let blockchain2 = Arc::new(RwLock::new(
+        Blockchain::new(env2.clone(), NetworkId::UnitAlbatross, time).unwrap(),
+    ));
     let mempool2 = Mempool::new(Arc::clone(&blockchain2), MempoolConfig::default());
 
     let net2 = Arc::new(hub.new_network());
@@ -104,12 +112,12 @@ async fn peers_can_sync() {
 
     assert!(sync_result.is_some());
     assert_eq!(
-        consensus2.blockchain.election_head_hash(),
-        consensus1.blockchain.election_head_hash(),
+        consensus2.blockchain.read().election_head_hash(),
+        consensus1.blockchain.read().election_head_hash(),
     );
     assert_eq!(
-        consensus2.blockchain.macro_head_hash(),
-        consensus1.blockchain.macro_head_hash(),
+        consensus2.blockchain.read().macro_head_hash(),
+        consensus1.blockchain.read().macro_head_hash(),
     );
 
     // FIXME: Add more tests
@@ -183,11 +191,15 @@ async fn peers_can_sync() {
 
 #[tokio::test]
 async fn sync_ingredients() {
+    //simple_logger::SimpleLogger::new().init().unwrap();
     let mut hub = MockHub::default();
 
     // Setup first peer.
+    let time = Arc::new(OffsetTime::new());
     let env1 = VolatileEnvironment::new(10).unwrap();
-    let blockchain1 = Arc::new(Blockchain::new(env1.clone(), NetworkId::UnitAlbatross).unwrap());
+    let blockchain1 = Arc::new(RwLock::new(
+        Blockchain::new(env1.clone(), NetworkId::UnitAlbatross, time).unwrap(),
+    ));
     let mempool1 = Mempool::new(Arc::clone(&blockchain1), MempoolConfig::default());
 
     let keypair =
@@ -219,7 +231,10 @@ async fn sync_ingredients() {
 
     // Setup second peer (not synced yet).
     let env2 = VolatileEnvironment::new(10).unwrap();
-    let blockchain2 = Arc::new(Blockchain::new(env2.clone(), NetworkId::UnitAlbatross).unwrap());
+    let time = Arc::new(OffsetTime::new());
+    let blockchain2 = Arc::new(RwLock::new(
+        Blockchain::new(env2.clone(), NetworkId::UnitAlbatross, time).unwrap(),
+    ));
     let mempool2 = Mempool::new(Arc::clone(&blockchain2), MempoolConfig::default());
 
     let net2 = Arc::new(hub.new_network());
@@ -238,7 +253,7 @@ async fn sync_ingredients() {
     let mut stream = consensus2.network.subscribe_events();
     net1.dial_mock(&net2);
     // Then wait for connection to be established.
-    stream.next().await.unwrap();
+    let _ = stream.next().await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await; // FIXME, Prof. Berrang told me to do this
 
     // Test ingredients:
@@ -246,67 +261,86 @@ async fn sync_ingredients() {
     let agent = ConsensusAgent::new(Arc::clone(&net2.get_peers()[0]));
     let hashes = agent
         .request_block_hashes(
-            vec![consensus2.blockchain.head_hash()],
+            vec![consensus2.blockchain.read().head_hash()],
             3,
             RequestBlockHashesFilter::ElectionAndLatestCheckpoint,
         )
         .await
-        .expect("Should yield hashes");
-    assert_eq!(hashes.hashes.len(), 2);
+        .expect("Should yield hashes")
+        .hashes
+        .expect("Should contain hashes");
+    assert_eq!(hashes.len(), 2);
     assert_eq!(
-        hashes.hashes[0].1,
-        consensus1.blockchain.election_head_hash()
+        hashes[0].1,
+        consensus1.blockchain.read().election_head_hash()
     );
-    assert_eq!(hashes.hashes[1].1, consensus1.blockchain.macro_head_hash());
+    assert_eq!(hashes[1].1, consensus1.blockchain.read().macro_head_hash());
 
     // Request epoch
     let epoch = agent
-        .request_epoch(consensus1.blockchain.election_head_hash())
+        .request_epoch(consensus1.blockchain.read().election_head_hash())
         .await
         .expect("Should yield epoch");
+    let block1 = epoch.block.expect("Should have block");
+
     assert_eq!(epoch.history_len, 3);
     assert_eq!(
-        epoch.block.hash(),
-        consensus1.blockchain.election_head_hash()
+        block1.hash(),
+        consensus1.blockchain.read().election_head_hash()
     );
 
     let epoch = agent
-        .request_epoch(consensus1.blockchain.macro_head_hash())
+        .request_epoch(consensus1.blockchain.read().macro_head_hash())
         .await
         .expect("Should yield epoch");
+    let block2 = epoch.block.expect("Should have block");
+
     assert_eq!(epoch.history_len, 1);
-    assert_eq!(epoch.block.hash(), consensus1.blockchain.macro_head_hash());
+    assert_eq!(
+        block2.hash(),
+        consensus1.blockchain.read().macro_head_hash()
+    );
 
     // Request history chunk.
     let chunk = agent
-        .request_history_chunk(1, policy::EPOCH_LENGTH, 0)
+        .request_history_chunk(1, block1.block_number(), 0)
         .await
         .expect("Should yield history chunk")
         .chunk
         .expect("Should yield history chunk");
+
     assert_eq!(chunk.history.len(), 3);
     assert_eq!(
         chunk.verify(
             consensus1
                 .blockchain
+                .read()
                 .election_head()
                 .header
-                .history_root
-                .clone(),
+                .history_root,
             0
         ),
         Some(true)
     );
 
     let chunk = agent
-        .request_history_chunk(2, 1, 0)
+        .request_history_chunk(2, block2.block_number(), 0)
         .await
         .expect("Should yield history chunk")
         .chunk
         .expect("Should yield history chunk");
+
     assert_eq!(chunk.history.len(), 1);
     assert_eq!(
-        chunk.verify(consensus1.blockchain.macro_head().header.history_root, 0),
+        chunk.verify(
+            consensus1
+                .blockchain
+                .read()
+                .macro_head()
+                .header
+                .history_root,
+            0
+        ),
         Some(true)
     );
 }

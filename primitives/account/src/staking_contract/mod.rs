@@ -1,193 +1,311 @@
-use std::cmp::Ordering;
 use std::collections::btree_set::BTreeSet;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::iter::FromIterator;
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 use beserial::{
     Deserialize, DeserializeWithLength, ReadBytesExt, Serialize, SerializeWithLength,
     SerializingError, WriteBytesExt,
 };
-use keys::Address;
-use nimiq_bls::CompressedSignature as BlsSignature;
 use nimiq_collections::BitSet;
-use primitives::account::ValidatorId;
-use primitives::slots::{Validators, ValidatorsBuilder};
-use primitives::{coin::Coin, policy};
-use transaction::account::staking_contract::IncomingStakingTransactionData;
-use transaction::{SignatureProof, Transaction};
-use vrf::{AliasMethod, VrfSeed, VrfUseCase};
+use nimiq_database::{Transaction as DBTransaction, WriteTransaction};
+use nimiq_keys::Address;
+use nimiq_primitives::slots::{Validators, ValidatorsBuilder};
+use nimiq_primitives::{coin::Coin, policy};
+use nimiq_trie::key_nibbles::KeyNibbles;
+use nimiq_vrf::{AliasMethod, VrfSeed, VrfUseCase};
+pub use receipts::*;
+pub use staker::Staker;
+pub use validator::Validator;
 
-use crate::AccountError;
+use crate::{Account, AccountsTrie};
 
-pub use self::validator::*;
-
-pub mod actions;
-pub mod validator;
-
-/// Struct represent an inactive staker. An inactive staker is a staker that got its stake not
-/// eligible for slot selection. In other words, this staker can no longer receive slots.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct InactiveStake {
-    // The balance of the stake.
-    pub balance: Coin,
-    // The block number when the stake became inactive.
-    pub retire_time: u32,
-}
-
-/// A receipt for slash inherents. It shows whether a given slot or validator was newly disabled,
-/// lost rewards or parked by a specific slash inherent. This is necessary to be able to revert
-/// slash inherents.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct SlashReceipt {
-    newly_parked: bool,
-    newly_disabled: bool,
-    newly_lost_rewards: bool,
-}
+mod receipts;
+mod staker;
+mod traits;
+mod validator;
 
 /// The struct representing the staking contract. The staking contract is a special contract that
-/// handles many functions related to validators and staking.
-#[derive(Debug)]
+/// handles most functions related to validators and staking.
+/// The overall staking contract is a subtrie in the AccountsTrie that is composed of several
+/// different account types. Each different account type is intended to store a different piece of
+/// data concerning the staking contract. By having the path to each account you can navigate the
+/// staking contract subtrie. The subtrie has the following format:
+/**
+///     STAKING_CONTRACT_ADDRESS
+///         |--> PATH_CONTRACT_MAIN: Staking(StakingContract)
+///         |
+///         |--> PATH_VALIDATORS_LIST
+///         |       |--> VALIDATOR_ADDRESS
+///         |               |--> PATH_VALIDATOR_MAIN: StakingValidator(Validator)
+///         |               |--> PATH_VALIDATOR_STAKERS_LIST
+///         |                       |--> STAKER_ADDRESS: StakingValidatorsStaker(Address)
+///         |
+///         |--> PATH_STAKERS_LIST
+///                 |--> STAKER_ADDRESS: StakingStaker(Staker)
+*/
+/// So, for example, if you want to get the validator with a given address then you just fetch the
+/// node with key STAKING_CONTRACT_ADDRESS||PATH_VALIDATORS_LIST||VALIDATOR_ADDRESS||PATH_VALIDATOR_MAIN
+/// from the AccountsTrie (|| means concatenation).
+/// At a high level, the Staking Contract subtrie contains:
+///     - The Staking contract main. A struct that contains general information about the Staking contract.
+///     - A list of Validators. Each of them is a subtrie containing the Validator struct, with all
+///       the information relative to the Validator and a list of stakers that are validating for
+///       this validator (we store only the staker address).
+///     - A list of Stakers, with each Staker struct containing all information about a staker.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StakingContract {
-    // The total amount of coins staked.
+    // The total amount of coins staked (also includes validators deposits).
     pub balance: Coin,
-    // The active validators (i.e. are eligible to receive slots) sorted by public key.
-    pub active_validators_sorted: BTreeSet<Arc<Validator>>,
-    // A hashmap of the active validators, indexed by the validator id
-    pub active_validators_by_id: HashMap<ValidatorId, Arc<Validator>>,
-    // A hashmap of the inactive stakers (i.e. are NOT eligible to receive slots), indexed by the
-    // staker address.
-    pub inactive_stake_by_address: HashMap<Address, InactiveStake>,
-    // A tree of the inactive validators , searchable by the validator id.
-    pub inactive_validators_by_id: BTreeMap<ValidatorId, InactiveValidator>,
+    // The list of active validators addresses (i.e. are eligible to receive slots) and their
+    // corresponding balances.
+    pub active_validators: BTreeMap<Address, Coin>,
     // The validators that were parked during the current epoch.
-    pub current_epoch_parking: HashSet<ValidatorId>,
-    // The validators that were parked during the previous epoch.
-    pub previous_epoch_parking: HashSet<ValidatorId>,
-    // The validator slots that lost rewards (i.e. are no longer eligible to receive rewards) during
+    pub parked_set: BTreeSet<Address>,
+    // The validator slots that lost rewards (i.e. are not eligible to receive rewards) during
     // the current batch.
     pub current_lost_rewards: BitSet,
-    // The validator slots that lost rewards (i.e. are no longer eligible to receive rewards) during
+    // The validator slots that lost rewards (i.e. are not eligible to receive rewards) during
     // the previous batch.
     pub previous_lost_rewards: BitSet,
-    // The validator slots, searchable by the validator public key, that are disabled (i.e. are no
+    // The validator slots, searchable by the validator address, that are disabled (i.e. are no
     // longer eligible to produce blocks) currently.
-    pub current_disabled_slots: BTreeMap<ValidatorId, BTreeSet<u16>>,
-    // The validator slots, searchable by the validator public key, that were disabled (i.e. are no
-    // longer eligible to produce blocks) at the end of the previous batch.
-    pub previous_disabled_slots: BTreeMap<ValidatorId, BTreeSet<u16>>,
+    pub current_disabled_slots: BTreeMap<Address, BTreeSet<u16>>,
+    // The validator slots, searchable by the validator address, that were disabled (i.e. are no
+    // longer eligible to produce blocks) during the previous batch.
+    pub previous_disabled_slots: BTreeMap<Address, BTreeSet<u16>>,
 }
 
 impl StakingContract {
-    /// Get a validator information given its id.
-    pub fn get_validator(&self, validator_id: &ValidatorId) -> Option<&Arc<Validator>> {
-        self.active_validators_by_id.get(validator_id).or_else(|| {
-            self.inactive_validators_by_id
-                .get(validator_id)
-                .map(|inactive_validator| &inactive_validator.validator)
-        })
+    /// This is the byte path for the main struct in the staking contract.
+    pub const PATH_CONTRACT_MAIN: u8 = 0;
+
+    /// This is the byte path for the validators list in the staking contract.
+    pub const PATH_VALIDATORS_LIST: u8 = 1;
+
+    /// This is the byte path for the stakers list in the staking contract.
+    pub const PATH_STAKERS_LIST: u8 = 2;
+
+    /// This is the byte path for the main struct for a single validator (in the validators list).
+    pub const PATH_VALIDATOR_MAIN: u8 = 0;
+
+    /// This is the byte path for the stakers list for a single validator (in the validators list).
+    pub const PATH_VALIDATOR_STAKERS_LIST: u8 = 1;
+
+    /// Returns the key in the AccountsTrie for the Staking contract struct.
+    pub fn get_key_staking_contract() -> KeyNibbles {
+        let mut bytes = Vec::with_capacity(21);
+        bytes.extend(
+            Address::from_user_friendly_address(policy::STAKING_CONTRACT_ADDRESS)
+                .expect("Couldn't parse the staking contract address!")
+                .as_bytes(),
+        );
+        bytes.push(StakingContract::PATH_CONTRACT_MAIN);
+
+        KeyNibbles::from(bytes.as_slice())
     }
 
-    /// Get the amount staked by a staker, given the public key of the corresponding validator and
-    /// the address of the staker. Returns None if the active validator or the staker does not exist.
-    pub fn get_active_stake(
-        &self,
-        validator_id: &ValidatorId,
+    /// Returns the key in the AccountsTrie for a Validator struct with a given validator address.
+    pub fn get_key_validator(validator_address: &Address) -> KeyNibbles {
+        let mut bytes = Vec::with_capacity(42);
+        bytes.extend(
+            Address::from_user_friendly_address(policy::STAKING_CONTRACT_ADDRESS)
+                .expect("Couldn't parse the staking contract address!")
+                .as_bytes(),
+        );
+        bytes.push(StakingContract::PATH_VALIDATORS_LIST);
+        bytes.extend(validator_address.as_slice());
+        bytes.push(StakingContract::PATH_VALIDATOR_MAIN);
+
+        KeyNibbles::from(bytes.as_slice())
+    }
+
+    /// Returns the key in the AccountsTrie for the given staker validating for the given validator.
+    pub fn get_key_validator_staker(
+        validator_address: &Address,
         staker_address: &Address,
-    ) -> Option<Coin> {
-        let validator = self.active_validators_by_id.get(validator_id)?;
+    ) -> KeyNibbles {
+        let mut bytes = Vec::with_capacity(62);
+        bytes.extend(
+            Address::from_user_friendly_address(policy::STAKING_CONTRACT_ADDRESS)
+                .expect("Couldn't parse the staking contract address!")
+                .as_bytes(),
+        );
+        bytes.push(StakingContract::PATH_VALIDATORS_LIST);
+        bytes.extend(validator_address.as_slice());
+        bytes.push(StakingContract::PATH_VALIDATOR_STAKERS_LIST);
+        bytes.extend(staker_address.as_slice());
 
-        validator
-            .active_stake_by_address
-            .read()
-            .get(staker_address)
-            .cloned()
+        KeyNibbles::from(bytes.as_slice())
     }
 
-    /// Allows to modify both active and inactive validators.
-    /// It returns a validator entry, which subsumes active and inactive validators.
-    /// It also allows for deferred error handling after re-adding the validator using `restore_validator`.
-    pub fn remove_validator(&mut self, validator_id: &ValidatorId) -> Option<ValidatorEntry> {
-        if let Some(validator) = self.active_validators_by_id.remove(&validator_id) {
-            self.active_validators_sorted.remove(&validator);
-            Some(ValidatorEntry::new_active_validator(validator))
-        } else {
-            //  The else case is needed to ensure the validator_key still exists.
-            self.inactive_validators_by_id
-                .remove(&validator_id)
-                .map(ValidatorEntry::new_inactive_validator)
+    /// Returns the key in the AccountsTrie for a Staker struct with a given staker address.
+    pub fn get_key_staker(staker_address: &Address) -> KeyNibbles {
+        let mut bytes = Vec::with_capacity(41);
+        bytes.extend(
+            Address::from_user_friendly_address(policy::STAKING_CONTRACT_ADDRESS)
+                .expect("Couldn't parse the staking contract address!")
+                .as_bytes(),
+        );
+        bytes.push(StakingContract::PATH_STAKERS_LIST);
+        bytes.extend(staker_address.as_bytes());
+
+        KeyNibbles::from(bytes.as_slice())
+    }
+
+    /// Get the staking contract information.
+    pub fn get_staking_contract(
+        accounts_tree: &AccountsTrie,
+        db_txn: &DBTransaction,
+    ) -> StakingContract {
+        let key = StakingContract::get_key_staking_contract();
+
+        trace!(
+            "Trying to fetch staking contract at key {}.",
+            key.to_string()
+        );
+
+        match accounts_tree.get(db_txn, &key) {
+            Some(Account::Staking(contract)) => contract,
+            _ => {
+                unreachable!()
+            }
         }
     }
 
-    /// Restores/saves a validator entry.
-    /// If modifying the validator failed, it is restored and the error is returned.
-    /// This makes it possible to remove the validator using `remove_validator`,
-    /// try modifying it and restoring it before the error is returned.
-    pub fn restore_validator(
-        &mut self,
-        validator_entry: ValidatorEntry,
-    ) -> Result<(), AccountError> {
-        match validator_entry {
-            ValidatorEntry::Active(validator, error) => {
-                // Update/restore validator.
-                self.active_validators_sorted.insert(Arc::clone(&validator));
-                self.active_validators_by_id
-                    .insert(validator.id.clone(), validator);
-                error.map(Err).unwrap_or(Ok(()))
-            }
-            ValidatorEntry::Inactive(validator, error) => {
-                // Update/restore validator.
-                self.inactive_validators_by_id
-                    .insert(validator.validator.id.clone(), validator);
-                error.map(Err).unwrap_or(Ok(()))
+    /// Get a validator information given its address, if it exists.
+    pub fn get_validator(
+        accounts_tree: &AccountsTrie,
+        db_txn: &DBTransaction,
+        validator_address: &Address,
+    ) -> Option<Validator> {
+        let key = StakingContract::get_key_validator(validator_address);
+
+        trace!(
+            "Trying to fetch validator with address {} at key {}.",
+            validator_address.to_string(),
+            key.to_string()
+        );
+
+        match accounts_tree.get(db_txn, &key) {
+            Some(Account::StakingValidator(validator)) => Some(validator),
+            None => None,
+            _ => {
+                unreachable!()
             }
         }
     }
 
-    /// Given a seed, it randomly distributes the validator slots across all validators. It can be
+    /// Get a list containing the addresses of all the stakers that delegating for a given validator.
+    pub fn get_validator_stakers(
+        accounts_tree: &AccountsTrie,
+        db_txn: &DBTransaction,
+        validator_address: &Address,
+    ) -> Vec<Address> {
+        let key = StakingContract::get_key_validator(validator_address);
+
+        trace!(
+            "Trying to fetch validator with address {} at key {}.",
+            validator_address.to_string(),
+            key.to_string()
+        );
+
+        let validator = match accounts_tree.get(db_txn, &key) {
+            Some(Account::StakingValidator(validator)) => validator,
+            _ => return vec![],
+        };
+
+        let num_stakers = validator.num_stakers as usize;
+
+        let empty_staker_key =
+            StakingContract::get_key_validator_staker(validator_address, &Address::from([0; 20]));
+
+        let chunk = accounts_tree.get_chunk(db_txn, &empty_staker_key, num_stakers);
+
+        let mut stakers = vec![];
+
+        for account in chunk {
+            match account {
+                Account::StakingValidatorsStaker(address) => stakers.push(address),
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+
+        stakers
+    }
+
+    /// Get a staker information given its address, if it exists.
+    pub fn get_staker(
+        accounts_tree: &AccountsTrie,
+        db_txn: &DBTransaction,
+        staker_address: &Address,
+    ) -> Option<Staker> {
+        let key = StakingContract::get_key_staker(staker_address);
+
+        trace!(
+            "Trying to fetch staker with address {} at key {}.",
+            staker_address.to_string(),
+            key.to_string()
+        );
+
+        match accounts_tree.get(db_txn, &key) {
+            Some(Account::StakingStaker(staker)) => Some(staker),
+            None => None,
+            _ => {
+                unreachable!()
+            }
+        }
+    }
+
+    /// Creates a new Staking contract into the given accounts tree.
+    pub fn create(accounts_tree: &AccountsTrie, db_txn: &mut WriteTransaction) {
+        trace!("Trying to put the staking contract in the accounts tree.");
+
+        accounts_tree.put(
+            db_txn,
+            &StakingContract::get_key_staking_contract(),
+            Account::Staking(StakingContract::default()),
+        )
+    }
+
+    /// Given a seed, it randomly distributes the validator slots across all validators. It is
     /// used to select the validators for the next epoch.
-    pub fn select_validators(&self, seed: &VrfSeed) -> Validators {
-        // TODO: Depending on the circumstances and parameters, it might be more efficient to store
-        // active stake in an unsorted Vec.
-        // Then, we would not need to create the Vec here. But then, removal of stake is a O(n) operation.
-        // Assuming that validator selection happens less frequently than stake removal, the current
-        // implementation might be ok.
-        let mut potential_validators = Vec::with_capacity(self.active_validators_sorted.len());
-        let mut weights: Vec<u64> = Vec::with_capacity(self.active_validators_sorted.len());
+    pub fn select_validators(
+        accounts_tree: &AccountsTrie,
+        db_txn: &DBTransaction,
+        seed: &VrfSeed,
+    ) -> Validators {
+        let staking_contract = StakingContract::get_staking_contract(accounts_tree, db_txn);
 
-        debug!("Select validators: num_slots = {}", policy::SLOTS);
+        let mut validator_addresses = Vec::with_capacity(staking_contract.active_validators.len());
+        let mut validator_stakes = Vec::with_capacity(staking_contract.active_validators.len());
 
-        // NOTE: `active_validators_sorted` is sorted from highest to lowest stake. `LookupTable`
-        // expects the reverse ordering.
-        for validator in self.active_validators_sorted.iter() {
-            potential_validators.push(Arc::clone(validator));
-            weights.push(validator.balance.into());
+        debug!("Selecting validators: num_slots = {}", policy::SLOTS);
+
+        for (address, coin) in &staking_contract.active_validators {
+            validator_addresses.push(address);
+            validator_stakes.push(u64::from(*coin));
         }
+
+        let mut rng = seed.rng(VrfUseCase::ValidatorSelection, 0);
+
+        let lookup = AliasMethod::new(validator_stakes);
 
         let mut slots_builder = ValidatorsBuilder::default();
-        let lookup = AliasMethod::new(weights);
-        let mut rng = seed.rng(VrfUseCase::ValidatorSelection, 0);
 
         for _ in 0..policy::SLOTS {
             let index = lookup.sample(&mut rng);
 
-            let active_validator = &potential_validators[index];
+            let chosen_validator =
+                StakingContract::get_validator(accounts_tree, db_txn, validator_addresses[index]).expect("Couldn't find in the accounts tree a validator that was in the active validators list!");
 
             slots_builder.push(
-                active_validator.id.clone(),
-                active_validator.validator_key.clone(),
+                chosen_validator.address.clone(),
+                chosen_validator.validator_key.clone(),
             );
         }
 
         slots_builder.build()
-    }
-
-    /// Get the signature from a transaction.
-    fn get_self_signer(transaction: &Transaction) -> Result<Address, AccountError> {
-        let signature_proof: SignatureProof =
-            Deserialize::deserialize(&mut &transaction.proof[..])?;
-
-        Ok(signature_proof.compute_signer())
     }
 
     /// Returns a BitSet of slots that lost its rewards in the previous batch.
@@ -221,67 +339,21 @@ impl StakingContract {
         }
         bitset
     }
-
-    fn verify_signature_incoming(
-        &self,
-        transaction: &Transaction,
-        validator_id: &ValidatorId,
-        signature: &BlsSignature,
-    ) -> Result<(), AccountError> {
-        let validator = self
-            .get_validator(validator_id)
-            .ok_or(AccountError::InvalidForRecipient)?;
-        let key = validator
-            .validator_key
-            .uncompress()
-            .map_err(|_| AccountError::InvalidForRecipient)?;
-        let sig = signature
-            .uncompress()
-            .map_err(|_| AccountError::InvalidSignature)?;
-
-        // On incoming transactions, we need to reset the signature first.
-        let mut tx_without_sig = transaction.clone();
-        tx_without_sig.data = IncomingStakingTransactionData::set_validator_signature_on_data(
-            &tx_without_sig.data,
-            BlsSignature::default(),
-        )?;
-        let tx = tx_without_sig.serialize_content();
-
-        if !key.verify(&tx, &sig) {
-            warn!("Invalid signature");
-
-            return Err(AccountError::InvalidSignature);
-        }
-        Ok(())
-    }
 }
 
 impl Serialize for StakingContract {
     fn serialize<W: WriteBytesExt>(&self, writer: &mut W) -> Result<usize, SerializingError> {
         let mut size = 0;
+
         size += Serialize::serialize(&self.balance, writer)?;
 
-        // Active validators first.
-        size += Serialize::serialize(&(self.active_validators_sorted.len() as u32), writer)?;
-        for active_validator in self.active_validators_sorted.iter() {
-            size += Serialize::serialize(active_validator, writer)?;
-        }
+        size += SerializeWithLength::serialize::<u32, _>(&self.active_validators, writer)?;
 
-        // Inactive validators next.
-        size += Serialize::serialize(&(self.inactive_validators_by_id.len() as u32), writer)?;
-        for (_, inactive_validator) in self.inactive_validators_by_id.iter() {
-            size += Serialize::serialize(inactive_validator, writer)?;
-        }
+        size += SerializeWithLength::serialize::<u32, _>(&self.parked_set, writer)?;
 
-        // Parking.
-        size += SerializeWithLength::serialize::<u32, _>(&self.current_epoch_parking, writer)?;
-        size += SerializeWithLength::serialize::<u32, _>(&self.previous_epoch_parking, writer)?;
-
-        // Lost rewards.
         size += Serialize::serialize(&self.current_lost_rewards, writer)?;
         size += Serialize::serialize(&self.previous_lost_rewards, writer)?;
 
-        // Disabled slots.
         size += Serialize::serialize(&(self.current_disabled_slots.len() as u16), writer)?;
         for (key, slots) in self.current_disabled_slots.iter() {
             size += Serialize::serialize(key, writer)?;
@@ -293,23 +365,6 @@ impl Serialize for StakingContract {
             size += SerializeWithLength::serialize::<u16, _>(slots, writer)?;
         }
 
-        // Collect remaining inactive stakes.
-        let mut inactive_stakes = Vec::new();
-        for (staker_address, inactive_stake) in self.inactive_stake_by_address.iter() {
-            inactive_stakes.push((staker_address, inactive_stake));
-        }
-        inactive_stakes.sort_by(|a, b| {
-            a.0.cmp(b.0)
-                .then_with(|| a.1.balance.cmp(&b.1.balance))
-                .then_with(|| a.1.retire_time.cmp(&b.1.retire_time))
-        });
-
-        size += Serialize::serialize(&(inactive_stakes.len() as u32), writer)?;
-        for (staker_address, inactive_stake) in inactive_stakes {
-            size += Serialize::serialize(staker_address, writer)?;
-            size += Serialize::serialize(inactive_stake, writer)?;
-        }
-
         Ok(size)
     }
 
@@ -317,24 +372,13 @@ impl Serialize for StakingContract {
         let mut size = 0;
         size += Serialize::serialized_size(&self.balance);
 
-        size += Serialize::serialized_size(&0u32);
-        for active_validator in self.active_validators_sorted.iter() {
-            size += Serialize::serialized_size(active_validator);
-        }
+        size += SerializeWithLength::serialized_size::<u32>(&self.active_validators);
 
-        size += Serialize::serialized_size(&0u32);
-        for (_, inactive_validator) in self.inactive_validators_by_id.iter() {
-            size += Serialize::serialized_size(inactive_validator);
-        }
+        size += SerializeWithLength::serialized_size::<u32>(&self.parked_set);
 
-        size += SerializeWithLength::serialized_size::<u32>(&self.current_epoch_parking);
-        size += SerializeWithLength::serialized_size::<u32>(&self.previous_epoch_parking);
-
-        // Lost rewards.
         size += Serialize::serialized_size(&self.current_lost_rewards);
         size += Serialize::serialized_size(&self.previous_lost_rewards);
 
-        // Disabled slots.
         size += Serialize::serialized_size(&(self.current_disabled_slots.len() as u16));
         for (key, slots) in self.current_disabled_slots.iter() {
             size += Serialize::serialized_size(key);
@@ -346,12 +390,6 @@ impl Serialize for StakingContract {
             size += SerializeWithLength::serialized_size::<u16>(slots);
         }
 
-        size += Serialize::serialized_size(&0u32);
-        for (staker_address, inactive_stake) in self.inactive_stake_by_address.iter() {
-            size += Serialize::serialized_size(staker_address);
-            size += Serialize::serialized_size(inactive_stake);
-        }
-
         size
     }
 }
@@ -360,142 +398,37 @@ impl Deserialize for StakingContract {
     fn deserialize<R: ReadBytesExt>(reader: &mut R) -> Result<Self, SerializingError> {
         let balance = Deserialize::deserialize(reader)?;
 
-        let mut active_validators_sorted = BTreeSet::new();
-        let mut active_validators_by_id = HashMap::new();
-        let mut inactive_validators_by_id = BTreeMap::new();
-        let mut inactive_stake_by_address = HashMap::new();
+        let active_validators = DeserializeWithLength::deserialize::<u32, _>(reader)?;
 
-        let num_active_validators: u32 = Deserialize::deserialize(reader)?;
-        for _ in 0..num_active_validators {
-            let active_validator: Validator = Deserialize::deserialize(reader)?;
-            let active_validator = Arc::new(active_validator);
+        let parked_set = DeserializeWithLength::deserialize::<u32, _>(reader)?;
 
-            active_validators_sorted.insert(Arc::clone(&active_validator));
-            active_validators_by_id.insert(active_validator.id.clone(), active_validator);
-        }
+        let current_lost_rewards = Deserialize::deserialize(reader)?;
+        let previous_lost_rewards = Deserialize::deserialize(reader)?;
 
-        let num_inactive_validators: u32 = Deserialize::deserialize(reader)?;
-        for _ in 0..num_inactive_validators {
-            let inactive_validator: InactiveValidator = Deserialize::deserialize(reader)?;
-
-            inactive_validators_by_id
-                .insert(inactive_validator.validator.id.clone(), inactive_validator);
-        }
-
-        let current_epoch_parking: HashSet<ValidatorId> =
-            DeserializeWithLength::deserialize::<u32, _>(reader)?;
-        let previous_epoch_parking: HashSet<ValidatorId> =
-            DeserializeWithLength::deserialize::<u32, _>(reader)?;
-
-        // Lost rewards.
-        let current_lost_rewards: BitSet = Deserialize::deserialize(reader)?;
-        let previous_lost_rewards: BitSet = Deserialize::deserialize(reader)?;
-
-        // Disabled slots.
         let num_current_disabled_slots: u16 = Deserialize::deserialize(reader)?;
         let mut current_disabled_slots = BTreeMap::new();
         for _ in 0..num_current_disabled_slots {
-            let key: ValidatorId = Deserialize::deserialize(reader)?;
+            let key: Address = Deserialize::deserialize(reader)?;
             let value = DeserializeWithLength::deserialize::<u16, _>(reader)?;
             current_disabled_slots.insert(key, value);
         }
+
         let num_previous_disabled_slots: u16 = Deserialize::deserialize(reader)?;
         let mut previous_disabled_slots = BTreeMap::new();
         for _ in 0..num_previous_disabled_slots {
-            let key: ValidatorId = Deserialize::deserialize(reader)?;
+            let key: Address = Deserialize::deserialize(reader)?;
             let value = DeserializeWithLength::deserialize::<u16, _>(reader)?;
             previous_disabled_slots.insert(key, value);
         }
 
-        let num_inactive_stakes: u32 = Deserialize::deserialize(reader)?;
-        for _ in 0..num_inactive_stakes {
-            let staker_address = Deserialize::deserialize(reader)?;
-            let inactive_stake = Deserialize::deserialize(reader)?;
-            inactive_stake_by_address.insert(staker_address, inactive_stake);
-        }
-
         Ok(StakingContract {
             balance,
-            active_validators_sorted,
-            active_validators_by_id,
-            inactive_stake_by_address,
-            inactive_validators_by_id,
-            current_epoch_parking,
-            previous_epoch_parking,
+            active_validators,
+            parked_set,
             current_lost_rewards,
             previous_lost_rewards,
             current_disabled_slots,
             previous_disabled_slots,
         })
-    }
-}
-
-// Not really useful traits for StakingContracts.
-// TODO: Assume a single staking contract for now, i.e. all staking contracts are equal.
-impl PartialEq for StakingContract {
-    fn eq(&self, _other: &StakingContract) -> bool {
-        true
-    }
-}
-
-impl Eq for StakingContract {}
-
-impl PartialOrd for StakingContract {
-    fn partial_cmp(&self, other: &StakingContract) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for StakingContract {
-    fn cmp(&self, _other: &Self) -> Ordering {
-        Ordering::Equal
-    }
-}
-
-impl Default for StakingContract {
-    fn default() -> Self {
-        StakingContract {
-            balance: Coin::ZERO,
-            active_validators_sorted: BTreeSet::new(),
-            active_validators_by_id: HashMap::new(),
-            inactive_validators_by_id: Default::default(),
-            current_epoch_parking: HashSet::new(),
-            previous_epoch_parking: HashSet::new(),
-            current_lost_rewards: Default::default(),
-            previous_lost_rewards: Default::default(),
-            current_disabled_slots: Default::default(),
-            previous_disabled_slots: Default::default(),
-            inactive_stake_by_address: HashMap::new(),
-        }
-    }
-}
-
-impl Clone for StakingContract {
-    fn clone(&self) -> Self {
-        let active_validators_by_id = HashMap::from_iter(
-            self.active_validators_by_id
-                .iter()
-                .map(|(key, value)| (key.clone(), Arc::new(value.as_ref().clone()))),
-        );
-        let inactive_validators_by_id = BTreeMap::from_iter(
-            self.inactive_validators_by_id
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-        StakingContract {
-            balance: self.balance,
-            active_validators_sorted: BTreeSet::from_iter(
-                active_validators_by_id.values().cloned(),
-            ),
-            active_validators_by_id,
-            inactive_validators_by_id,
-            current_epoch_parking: self.current_epoch_parking.clone(),
-            previous_epoch_parking: self.previous_epoch_parking.clone(),
-            current_lost_rewards: self.current_lost_rewards.clone(),
-            previous_lost_rewards: self.previous_lost_rewards.clone(),
-            current_disabled_slots: self.current_disabled_slots.clone(),
-            previous_disabled_slots: self.previous_disabled_slots.clone(),
-            inactive_stake_by_address: self.inactive_stake_by_address.clone(),
-        }
     }
 }

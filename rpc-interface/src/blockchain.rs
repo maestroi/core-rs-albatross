@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 
 use futures::stream::BoxStream;
-use nimiq_account::Account;
 use nimiq_hash::Blake2bHash;
 use nimiq_keys::Address;
+use nimiq_primitives::coin::Coin;
+use std::collections::HashMap;
 
-use crate::types::{Block, Inherent, SlashedSlots, Slot, Stakes, Transaction};
+use crate::types::{Account, Block, Inherent, SlashedSlots, Slot, Staker, Transaction, Validator};
 
 #[cfg_attr(
     feature = "proxy",
@@ -75,7 +76,15 @@ pub trait BlockchainInterface {
         max: Option<u16>,
     ) -> Result<Vec<Transaction>, Self::Error>;
 
-    async fn list_stakes(&mut self) -> Result<Stakes, Self::Error>;
+    async fn list_stakes(&mut self) -> Result<HashMap<Address, Coin>, Self::Error>;
+
+    async fn get_validator(
+        &mut self,
+        address: Address,
+        include_stakers: Option<bool>,
+    ) -> Result<Validator, Self::Error>;
+
+    async fn get_staker(&mut self, address: Address) -> Result<Staker, Self::Error>;
 
     #[stream]
     async fn head_subscribe(&mut self) -> Result<BoxStream<'static, Blake2bHash>, Self::Error>;

@@ -1,9 +1,9 @@
 use std::convert::TryInto;
 
 use beserial::{Deserialize, Serialize};
-use nimiq_account::AccountType;
 use nimiq_hash::{Blake2bHash, Blake2bHasher, HashOutput, Hasher};
 use nimiq_keys::{Address, KeyPair, PrivateKey};
+use nimiq_primitives::account::AccountType;
 use nimiq_primitives::networks::NetworkId;
 use nimiq_transaction::account::htlc_contract::{AnyHash, HashAlgorithm, ProofType};
 use nimiq_transaction::{SignatureProof, Transaction};
@@ -79,7 +79,7 @@ fn prepare_outgoing_transaction() -> (
     let hash_root = AnyHash::from(<[u8; 32]>::from(
         Blake2bHasher::default().digest(
             Blake2bHasher::default()
-                .digest(&pre_image.as_bytes())
+                .digest(pre_image.as_bytes())
                 .as_bytes(),
         ),
     ));

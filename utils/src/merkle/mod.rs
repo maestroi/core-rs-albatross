@@ -55,7 +55,7 @@ pub fn compute_root_from_slice<T: HashOutput>(values: &[T]) -> Cow<T> {
     Cow::Owned(hasher.finish())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MerklePath<H: HashOutput> {
     nodes: Vec<MerklePathNode<H>>,
 }
@@ -97,9 +97,9 @@ where
             len => {
                 let mid = len.ceiling_div(2);
                 let (contains_left, left_hash) =
-                    MerklePath::<H>::compute::<D, T>(&values[..mid], &leaf_hash, path);
+                    MerklePath::<H>::compute::<D, T>(&values[..mid], leaf_hash, path);
                 let (contains_right, right_hash) =
-                    MerklePath::<H>::compute::<D, T>(&values[mid..], &leaf_hash, path);
+                    MerklePath::<H>::compute::<D, T>(&values[mid..], leaf_hash, path);
                 hasher.hash(&left_hash);
                 hasher.hash(&right_hash);
 
@@ -263,7 +263,7 @@ where
         let mut value_index: usize = 0;
         while value_index < values.len() && leaf_index < values_to_proof.len() {
             let value = &values[value_index];
-            match value.cmp(&values_to_proof[leaf_index]) {
+            match value.cmp(values_to_proof[leaf_index]) {
                 // Leaf is included.
                 Ordering::Equal => {
                     final_values_to_proof.push(values_to_proof[leaf_index].clone());
@@ -321,12 +321,11 @@ where
                 let is_leaf = hashes_to_proof.contains(&hash);
                 if is_leaf {
                     operations.push(MerkleProofOperation::ConsumeInput);
-                    (is_leaf, hash)
                 } else {
                     path.push(hash.clone());
                     operations.push(MerkleProofOperation::ConsumeProof);
-                    (is_leaf, hash)
                 }
+                (is_leaf, hash)
             }
             len => {
                 let mut sub_path: Vec<H> = Vec::new();
@@ -335,13 +334,13 @@ where
                 let mid = len.ceiling_div(2);
                 let (contains_left, left_hash) = MerkleProof::<H>::compute(
                     &hashes[..mid],
-                    &hashes_to_proof,
+                    hashes_to_proof,
                     &mut sub_path,
                     &mut sub_operations,
                 );
                 let (contains_right, right_hash) = MerkleProof::<H>::compute(
                     &hashes[mid..],
-                    &hashes_to_proof,
+                    hashes_to_proof,
                     &mut sub_path,
                     &mut sub_operations,
                 );

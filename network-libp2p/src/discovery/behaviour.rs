@@ -121,7 +121,7 @@ impl DiscoveryBehaviour {
         clock: Arc<OffsetTime>,
     ) -> Self {
         let house_keeping_timer = Interval::new(config.house_keeping_interval);
-        peer_contact_book.write().self_update(&keypair);
+        peer_contact_book.write().update_own_contact(&keypair);
 
         Self {
             config,
@@ -187,7 +187,7 @@ impl NetworkBehaviour for DiscoveryBehaviour {
 
         self.events
             .push_back(NetworkBehaviourAction::NotifyHandler {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 handler: NotifyHandler::One(*connection_id),
                 event: HandlerInEvent::ObservedAddress(vec![remote_address.clone()]),
             });
@@ -232,7 +232,7 @@ impl NetworkBehaviour for DiscoveryBehaviour {
             Poll::Ready(Some(_)) => {
                 log::debug!("Doing house-keeping in peer address book.");
                 let mut peer_address_book = self.peer_contact_book.write();
-                peer_address_book.self_update(&self.keypair);
+                peer_address_book.update_own_contact(&self.keypair);
                 peer_address_book.house_keeping();
             }
             Poll::Ready(None) => unreachable!(),

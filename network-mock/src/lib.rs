@@ -9,8 +9,7 @@ use beserial::{Deserialize, Serialize};
 use derive_more::{Display, From, Into};
 
 pub use hub::MockHub;
-pub use network::MockId;
-pub use network::MockNetwork;
+pub use network::{MockId, MockNetwork};
 pub use peer::MockPeer;
 
 /// The address of a MockNetwork or a peer thereof. Peer IDs are always equal to their respective address, thus these
@@ -78,6 +77,7 @@ pub mod tests {
         peer::Peer,
     };
 
+    use super::network::MockNetworkError;
     use super::{MockHub, MockPeer, MockPeerId};
 
     pub async fn assert_peer_joined(
@@ -171,13 +171,9 @@ pub mod tests {
     impl Topic for TestTopic {
         type Item = TestRecord;
 
-        fn topic(&self) -> String {
-            "hello_world".to_owned()
-        }
-
-        fn validate(&self) -> bool {
-            false
-        }
+        const BUFFER_SIZE: usize = 8;
+        const NAME: &'static str = "hello_world";
+        const VALIDATE: bool = false;
     }
 
     fn consume_stream<T: std::fmt::Debug>(
@@ -193,30 +189,26 @@ pub mod tests {
         let net2 = hub.new_network();
         net1.dial_mock(&net2);
 
-        /* This is needed for libp2p's gossipsub, because meshes need a min size to work
-        for _ in 0 .. 5i32 {
-            let net_n = hub.new_network();
-            net_n.subscribe_events().next().await;
-            let stream_n = net_n.subscribe(&TestTopic).await.unwrap();
-            consume_stream(stream_n);
-        }*/
-
         let test_message = TestRecord { x: 42 };
 
-        let mut messages = net1.subscribe(&TestTopic).await.unwrap();
-        consume_stream(net2.subscribe(&TestTopic).await.unwrap());
+        let mut messages = net1.subscribe::<TestTopic>().await.unwrap();
+        consume_stream(net2.subscribe::<TestTopic>().await.unwrap());
 
-        // same as above
-        // tokio::time::sleep(Duration::from_secs(10)).await;
-
-        net2.publish(&TestTopic, test_message.clone())
+        net2.publish::<TestTopic>(test_message.clone())
             .await
             .unwrap();
 
         let (received_message, _peer) = messages.next().await.unwrap();
-        log::info!("Received GossipSub message: {:?}", received_message);
+        log::info!("Received Gossipsub message: {:?}", received_message);
 
         assert_eq!(received_message, test_message);
+
+        // Assert that we can unsubscribe from topics
+        assert_eq!(Ok(()), net1.unsubscribe::<TestTopic>().await);
+        assert_eq!(
+            Err(MockNetworkError::AlreadyUnsubscribed(TestTopic::NAME)),
+            net1.unsubscribe::<TestTopic>().await
+        );
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]

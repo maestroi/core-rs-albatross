@@ -18,13 +18,14 @@ maintenance = { status = "experimental" }
 
 [dependencies]
 log = "0.4"
-parking_lot = "0.9"
+parking_lot = "0.11"
 
 beserial = { path = "../beserial" }
 nimiq-account = { path = "../primitives/account" }
 nimiq-block = { path = "../primitives/block" }
 nimiq-blockchain = { path = "../blockchain" }
 nimiq-collections = { path = "../collections" }
+nimiq-database = { path = "../database" }
 nimiq-hash = { path = "../hash" }
 nimiq-keys = { path = "../keys" }
 nimiq-primitives = { path = "../primitives", features = ["coin", "networks"] }

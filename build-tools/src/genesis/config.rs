@@ -7,7 +7,6 @@ use serde::{Deserialize, Deserializer};
 use beserial::Deserialize as BDeserialize;
 use bls::{PublicKey as BlsPublicKey, SecretKey as BlsSecretKey};
 use keys::Address;
-use primitives::account::ValidatorId;
 use primitives::coin::Coin;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -24,41 +23,37 @@ pub struct GenesisConfig {
     pub validators: Vec<GenesisValidator>,
 
     #[serde(default)]
-    pub stakes: Vec<GenesisStake>,
+    pub stakers: Vec<GenesisStaker>,
 
     #[serde(default)]
     pub accounts: Vec<GenesisAccount>,
-
-    #[serde(default)]
-    #[serde(deserialize_with = "deserialize_nimiq_address_opt")]
-    pub staking_contract: Option<Address>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GenesisValidator {
-    #[serde(deserialize_with = "deserialize_validator_id")]
-    pub validator_id: ValidatorId,
+    #[serde(deserialize_with = "deserialize_nimiq_address")]
+    pub validator_address: Address,
 
     #[serde(deserialize_with = "deserialize_nimiq_address")]
-    pub reward_address: Address,
-
-    #[serde(deserialize_with = "deserialize_coin")]
-    pub balance: Coin,
+    pub warm_address: Address,
 
     #[serde(deserialize_with = "deserialize_bls_public_key")]
     pub validator_key: BlsPublicKey,
+
+    #[serde(deserialize_with = "deserialize_nimiq_address")]
+    pub reward_address: Address,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct GenesisStake {
+pub struct GenesisStaker {
     #[serde(deserialize_with = "deserialize_nimiq_address")]
     pub staker_address: Address,
 
     #[serde(deserialize_with = "deserialize_coin")]
     pub balance: Coin,
 
-    #[serde(deserialize_with = "deserialize_validator_id")]
-    pub validator_id: ValidatorId,
+    #[serde(deserialize_with = "deserialize_nimiq_address")]
+    pub delegation: Address,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -78,6 +73,7 @@ where
     Address::from_user_friendly_address(&s).map_err(|e| Error::custom(format!("{:?}", e)))
 }
 
+#[allow(dead_code)]
 pub fn deserialize_nimiq_address_opt<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
 where
     D: Deserializer<'de>,
@@ -99,15 +95,6 @@ where
 {
     let value: u64 = Deserialize::deserialize(deserializer)?;
     Coin::try_from(value).map_err(Error::custom)
-}
-
-pub(crate) fn deserialize_validator_id<'de, D>(deserializer: D) -> Result<ValidatorId, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let validator_id_hex: String = Deserialize::deserialize(deserializer)?;
-    let validator_id_raw = hex::decode(validator_id_hex).map_err(Error::custom)?;
-    ValidatorId::deserialize_from_vec(&validator_id_raw).map_err(Error::custom)
 }
 
 pub(crate) fn deserialize_bls_public_key<'de, D>(deserializer: D) -> Result<BlsPublicKey, D::Error>

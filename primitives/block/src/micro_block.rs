@@ -1,7 +1,8 @@
-use std::fmt;
+use std::{fmt, io};
 
 use beserial::{Deserialize, Serialize};
 use nimiq_bls::CompressedSignature;
+use nimiq_database::{FromDatabaseValue, IntoDatabaseValue};
 use nimiq_hash::{Blake2bHash, Hash, SerializeContent};
 use nimiq_hash_derive::SerializeContent;
 use nimiq_transaction::Transaction;
@@ -102,6 +103,26 @@ impl MicroBody {
         /*fork_proofs size*/
         2 + num_fork_proofs * ForkProof::SIZE
             + /*transactions size*/ 2
+    }
+}
+
+impl IntoDatabaseValue for MicroBlock {
+    fn database_byte_size(&self) -> usize {
+        self.serialized_size()
+    }
+
+    fn copy_into_database(&self, mut bytes: &mut [u8]) {
+        Serialize::serialize(&self, &mut bytes).unwrap();
+    }
+}
+
+impl FromDatabaseValue for MicroBlock {
+    fn copy_from_database(bytes: &[u8]) -> io::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut cursor = io::Cursor::new(bytes);
+        Ok(Deserialize::deserialize(&mut cursor)?)
     }
 }
 

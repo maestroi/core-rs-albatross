@@ -37,6 +37,10 @@ impl<H: HashOutput> IncrementalMerkleProofBuilder<H> {
         self.tree[0].len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tree[0].is_empty()
+    }
+
     /// Returns the chunk index the item is in.
     pub fn push_item<T: SerializeContent>(&mut self, value: &T) -> usize {
         self.push(H::Builder::default().chain(value).finish())
@@ -339,7 +343,7 @@ where
             }
 
             // Update parameters for next level.
-            current_level_owned = mem::replace(&mut next_level, vec![]);
+            current_level_owned = std::mem::take(&mut next_level);
             current_level = &current_level_owned;
             current_proof_nodes = mem::replace(&mut next_proof_nodes, BitSet::new());
 
